@@ -131,8 +131,13 @@ class HybridResolutionSinusoidalExtractor:
 
                 downsampled_versions[edge_freq] = upsampled
 
-        # Create bands by subtracting pre-computed versions
-        print("   Creating bands...")
+        # Create bands by subtracting pre-computed versions and export as WAV
+        print("   Creating and exporting bands...")
+
+        import os
+        band_dir = "bands"
+        os.makedirs(band_dir, exist_ok=True)
+
         band_signals = []
 
         for band_idx, (low_freq, high_freq) in enumerate(bands):
@@ -141,11 +146,16 @@ class HybridResolutionSinusoidalExtractor:
             rms = np.sqrt(np.mean(band_signal**2))
             print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
 
+            # Export band as WAV at original sample rate
+            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
+            sf.write(band_filename, band_signal, self.sample_rate)
+
             band_signals.append((low_freq, high_freq, band_signal))
 
         print(f"   ✓ Created {len(band_signals)} bands")
+        print(f"   ✓ Exported {len(band_signals)} band WAV files to {band_dir}/")
 
-        # TODO: Process each band with synchrosqueeze
+        # TODO: Process each band with synchrosqueeze (Step 2)
         # For now, return empty tracks
         return []
 
