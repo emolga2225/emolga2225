@@ -50,7 +50,7 @@ class HybridResolutionSinusoidalExtractor:
             print(f"\n   Processing channel {ch + 1}/{n_channels}...")
             audio_mono = audio[:, ch]
 
-            tracks = self.extract_with_overlapping_bands(audio_mono)
+            tracks = self.extract_with_bands(audio_mono)
 
             all_channel_tracks.append(tracks)
 
@@ -70,70 +70,39 @@ class HybridResolutionSinusoidalExtractor:
 
         return stft
 
-    def detect_transients(self, audio_mono, sensitivity=0.1):
-        """Detect regions with sharp changes in audio"""
-
-        print("   Detecting transients...")
-
-        # Simple derivative (detects amplitude changes)
-        diff = np.abs(np.diff(audio_mono))
-
-        # Pad to match original length
-        diff = np.pad(diff, (0, 1), mode='edge')
-
-        # Smooth to avoid noise
-        from scipy.signal import savgol_filter
-        smoothed = savgol_filter(diff, window_length=51, polyorder=3)
-
-        # Threshold - anything above this is a "transient"
-        threshold = np.percentile(smoothed, (1 - sensitivity) * 100)
-        transient_mask = smoothed > threshold
-
-        # Expand mask around transients (catch before/after)
-        expansion = int(0.005 * self.sample_rate)  # 5ms buffer
-        expanded_mask = np.zeros(len(audio_mono), dtype=bool)
-
-        for i in np.where(transient_mask)[0]:
-            start = max(0, i - expansion)
-            end = min(len(expanded_mask), i + expansion)
-            expanded_mask[start:end] = True
-
-        print(f"   Transient regions: {np.sum(expanded_mask) / len(expanded_mask) * 100:.1f}% of audio")
-
-        return expanded_mask
-
-    def extract_with_overlapping_bands(self, audio_mono):
-        """
-        Extract sinusoidal tracks using multi-band analysis with exact decimation.
-        """
+    def extract_with_bands(self, audio_mono):
+        """Extract bands based on sample rate (6kHz bandwidth per band)"""
         from scipy.signal import resample_poly
-        from ssqueezepy import ssq_stft
-        from scipy.optimize import linear_sum_assignment
+        from math import gcd
 
-        print("   Computing multi-band analysis...")
+        print("   Computing multi-band extraction...")
 
         nyquist = self.sample_rate / 2
 
-        # Fixed number of bands: 16 for 192kHz (scales with sample rate)
-        # This gives ~6kHz bandwidth per band for 192kHz
-        n_bands = 16
-        bandwidth = nyquist / n_bands
+        # Calculate number of bands based on sample rate
+        # Each band has 6kHz bandwidth
+        bandwidth = 6000  # Hz
+        n_bands = int(nyquist / bandwidth)
 
+        print(f"   Sample rate: {self.sample_rate} Hz")
+        print(f"   Nyquist: {nyquist/1000:.1f} kHz")
+        print(f"   Bandwidth per band: {bandwidth/1000:.1f} kHz")
+        print(f"   Number of bands: {n_bands}")
+
+        # Create band definitions
         bands = []
         for i in range(n_bands):
             low_freq = i * bandwidth
             high_freq = (i + 1) * bandwidth
             bands.append((low_freq, high_freq))
 
-        print(f"   Created {len(bands)} non-overlapping bands ({bandwidth/1000:.1f} kHz width)")
+        print(f"   Created {len(bands)} non-overlapping bands")
 
         # Collect all unique edge frequencies
         edge_freqs = sorted(set([low for low, high in bands] + [high for low, high in bands]))
-        print(f"   Pre-computing {len(edge_freqs)} downsampled versions for phase-coherent bands...")
+        print(f"   Pre-computing {len(edge_freqs)} downsampled versions...")
 
         # Pre-compute downsampled versions at each edge frequency
-        # This ensures phase coherence when we subtract to create bands
-        from math import gcd
         downsampled_versions = {}
 
         for edge_freq in edge_freqs:
@@ -144,8 +113,7 @@ class HybridResolutionSinusoidalExtractor:
             else:
                 target_sample_rate = edge_freq * 2
 
-                # Compute exact integer ratio using GCD to avoid rounding errors
-                # This ensures precise cutoff frequencies without aliasing
+                # Compute exact integer ratio using GCD
                 g = gcd(int(self.sample_rate), int(target_sample_rate))
                 down = int(self.sample_rate) // g
                 up = int(target_sample_rate) // g
@@ -153,7 +121,7 @@ class HybridResolutionSinusoidalExtractor:
                 # Downsample to target rate (lowpass filter)
                 downsampled = resample_poly(audio_mono, up, down)
 
-                # Upsample back to original rate (preserves lowpass filtering)
+                # Upsample back to original rate
                 upsampled = resample_poly(downsampled, down, up)
 
                 if len(upsampled) > len(audio_mono):
@@ -163,241 +131,23 @@ class HybridResolutionSinusoidalExtractor:
 
                 downsampled_versions[edge_freq] = upsampled
 
-        # Create bands by subtracting pre-computed versions and export as WAV
-        # This preserves phase relationships and avoids cancellation
-        print("   Exporting bands as WAV files...")
-
-        import os
-        band_dir = "bands"
-        os.makedirs(band_dir, exist_ok=True)
-
+        # Create bands by subtracting pre-computed versions
+        print("   Creating bands...")
         band_signals = []
-        band_files = []
-
-        # Downsampled sample rate for all bands (2x bandwidth)
-        band_sample_rate = int(bandwidth * 2)
 
         for band_idx, (low_freq, high_freq) in enumerate(bands):
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
 
-            # Frequency shift to baseband and downsample
-            # This allows SST processing at lower sample rate for better resolution
-            center_freq = (low_freq + high_freq) / 2
-            t = np.arange(len(band_signal)) / self.sample_rate
+            band_signals.append((low_freq, high_freq, band_signal))
 
-            # Complex demodulation to shift to baseband
-            shifted = band_signal * np.exp(-1j * 2 * np.pi * center_freq * t)
+        print(f"   ✓ Created {len(band_signals)} bands")
 
-            # Downsample to match bandwidth
-            g = gcd(int(self.sample_rate), band_sample_rate)
-            up = band_sample_rate // g
-            down = int(self.sample_rate) // g
-
-            # Downsample real and imaginary separately
-            shifted_real = resample_poly(np.real(shifted), up, down)
-            shifted_imag = resample_poly(np.imag(shifted), up, down)
-
-            # Take real part (baseband signal)
-            band_downsampled = shifted_real  # Real part is the baseband signal
-
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}, SR={band_sample_rate}Hz")
-
-            # Export downsampled band
-            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
-            sf.write(band_filename, band_downsampled, band_sample_rate)
-
-            # Store downsampled version for processing
-            band_signals.append((low_freq, high_freq, band_downsampled, band_sample_rate))
-            band_files.append(band_filename)
-
-        print(f"   ✓ Exported {len(band_files)} band WAV files to {band_dir}/")
-
-        # Process each band independently with synchrosqueezed STFT at lower sample rate
-        print("   Processing bands with synchrosqueezed STFT...")
-
-        all_band_tracks = []
-        global_track_id = 0
-        ssq_hop = 16
-
-        for band_idx, (low_freq, high_freq, band_signal, band_sr) in enumerate(tqdm(band_signals, desc="   Analyzing bands")):
-
-            # Run synchrosqueezed STFT on downsampled band at its sample rate
-            # This gives better time-frequency resolution matched to bandwidth
-            Tx, Sx, ssq_freqs, Sfs = ssq_stft(
-                band_signal,
-                window='blackmanharris',
-                n_fft=self.freq_fft_size,
-                hop_len=ssq_hop,
-                fs=band_sr,  # Use band sample rate, not original!
-                modulated=True,
-                dtype='float64'
-            )
-
-            tx_mag = np.abs(Tx)
-            sx_mag = np.abs(Sx) * self.freq_scale
-            sx_phase = np.angle(Sx)
-
-            n_freq_bins, n_time_frames = Sx.shape
-
-            # Extract peaks from each frame
-            ssq_peaks = []
-
-            for frame_idx in range(n_time_frames):
-                frame_tx = tx_mag[:, frame_idx]
-                frame_sx = sx_mag[:, frame_idx]
-                frame_phase = sx_phase[:, frame_idx]
-
-                peaks_idx, _ = find_peaks(frame_tx, distance=1)
-
-                peaks = []
-
-                for idx in peaks_idx[:self.max_peaks]:
-                    if ssq_freqs.ndim == 1:
-                        freq_baseband = ssq_freqs[idx]
-                    else:
-                        freq_baseband = ssq_freqs[idx, 0]
-
-                    # Filter to baseband range (0 to bandwidth)
-                    # Band has been frequency-shifted to baseband
-                    if freq_baseband < -bandwidth/2 or freq_baseband > bandwidth/2:
-                        continue
-
-                    if np.isnan(freq_baseband) or freq_baseband >= band_sr / 2:
-                        continue
-
-                    # Shift frequency back to original band range for storage
-                    center_freq = (low_freq + high_freq) / 2
-                    freq_original = freq_baseband + center_freq
-
-                    amp = frame_sx[idx]
-                    phase = frame_phase[idx]
-
-                    peaks.append({
-                        'frequency': freq_original,  # Store in original frequency range
-                        'amplitude': amp,
-                        'phase': phase,
-                        'bin': idx
-                    })
-
-                peaks.sort(key=lambda x: x['amplitude'], reverse=True)
-                ssq_peaks.append(peaks)
-
-            # Track peaks over time using Hungarian algorithm
-            active_tracks = []
-
-            for frame_idx, frame_peaks in enumerate(ssq_peaks):
-                if len(active_tracks) == 0:
-                    for peak in frame_peaks[:self.max_peaks]:
-                        new_track = {
-                            'id': global_track_id,
-                            'band': band_idx,
-                            'band_sr': band_sr,  # Store band sample rate
-                            'start_frame': frame_idx,
-                            'end_frame': frame_idx,
-                            'frequencies': [peak['frequency']],
-                            'amplitudes': [peak['amplitude']],
-                            'phases': [peak['phase']],
-                            'freq_frame_indices': [frame_idx]
-                        }
-                        active_tracks.append(new_track)
-                        global_track_id += 1
-                    continue
-
-                if len(frame_peaks) == 0:
-                    for track in active_tracks:
-                        track['frequencies'].append(track['frequencies'][-1])
-                        track['amplitudes'].append(0.0)
-                        track['phases'].append(track['phases'][-1])
-                        track['freq_frame_indices'].append(frame_idx)
-                        track['end_frame'] = frame_idx
-                    continue
-
-                # Hungarian matching
-                n_tracks = len(active_tracks)
-                n_peaks = len(frame_peaks)
-
-                LARGE_COST = 1e10
-                cost_matrix = np.full((n_tracks, n_peaks), LARGE_COST)
-
-                for i, track in enumerate(active_tracks):
-                    freq_pred = track['frequencies'][-1]
-                    for j, peak in enumerate(frame_peaks):
-                        cost_matrix[i, j] = abs(peak['frequency'] - freq_pred)
-
-                track_indices, peak_indices = linear_sum_assignment(cost_matrix)
-
-                matched_peaks = set()
-                matched_tracks = set()
-
-                for track_idx, peak_idx in zip(track_indices, peak_indices):
-                    if cost_matrix[track_idx, peak_idx] < LARGE_COST:
-                        track = active_tracks[track_idx]
-                        peak = frame_peaks[peak_idx]
-
-                        track['frequencies'].append(peak['frequency'])
-                        track['amplitudes'].append(peak['amplitude'])
-                        track['phases'].append(peak['phase'])
-                        track['freq_frame_indices'].append(frame_idx)
-                        track['end_frame'] = frame_idx
-
-                        matched_peaks.add(peak_idx)
-                        matched_tracks.add(track_idx)
-
-                for i, track in enumerate(active_tracks):
-                    if i not in matched_tracks:
-                        track['frequencies'].append(track['frequencies'][-1])
-                        track['amplitudes'].append(0.0)
-                        track['phases'].append(track['phases'][-1])
-                        track['freq_frame_indices'].append(frame_idx)
-                        track['end_frame'] = frame_idx
-
-                for j, peak in enumerate(frame_peaks):
-                    if j not in matched_peaks and len(active_tracks) < self.max_peaks:
-                        new_track = {
-                            'id': global_track_id,
-                            'start_frame': frame_idx,
-                            'end_frame': frame_idx,
-                            'band': band_idx,
-                            'band_sr': band_sr,  # Store band sample rate
-                            'frequencies': [peak['frequency']],
-                            'amplitudes': [peak['amplitude']],
-                            'phases': [peak['phase']],
-                            'freq_frame_indices': [frame_idx]
-                        }
-                        active_tracks.append(new_track)
-                        global_track_id += 1
-
-            all_band_tracks.extend(active_tracks)
-
-        print(f"   Total tracks: {len(all_band_tracks)}")
-
-        # Post-process
-        processed_tracks = []
-        for track in all_band_tracks:
-            # Use band sample rate for time calculation
-            freq_times = np.array(track['freq_frame_indices']) * ssq_hop / track['band_sr']
-
-            processed_track = {
-                'id': track['id'],
-                'band': track['band'],
-                'start_frame': track['start_frame'],
-                'end_frame': track['end_frame'],
-                'frequencies': track['frequencies'],
-                'phases': track['phases'],
-                'freq_frame_indices': track['freq_frame_indices'],
-                'freq_times': freq_times.tolist(),
-                'amplitudes': track['amplitudes'],
-                'amp_times': freq_times.tolist(),
-                'hop_size': ssq_hop,
-                'band_sr': track['band_sr']  # Store for synthesis
-            }
-            processed_tracks.append(processed_track)
-
-        print(f"   ✓ Created {len(processed_tracks)} tracks (multi-band + synchrosqueeze)")
-
-        return processed_tracks
+        # TODO: Process each band with synchrosqueeze
+        # For now, return empty tracks
+        return []
 
     def save_to_hdf5(self, filename, all_channel_tracks, is_stereo, audio_file=None):
         """Save extracted tracks to HDF5 with progress bar"""
@@ -564,7 +314,7 @@ class HybridResolutionSinusoidalExtractor:
 if __name__ == "__main__":
     import os
 
-    audio_file = "Reconstruct_short.wav"
+    audio_file = "Oooo_1sec_left.wav"
 
     # Read sample rate from file
     print(f"📂 Reading: {audio_file}")
@@ -576,44 +326,4 @@ if __name__ == "__main__":
 
     original, all_channel_tracks, is_stereo = extractor.analyze(audio_file)
 
-    # Save to HDF5
-    h5_file = audio_file.replace('.wav', '_tracks_multiband.h5')
-    extractor.save_to_hdf5(h5_file, all_channel_tracks, is_stereo, audio_file)
-
-    # Synthesize
-    n_samples = original.shape[0]
-    synthesized = extractor.synthesize_stereo(all_channel_tracks, n_samples, is_stereo)
-
-    # Metrics
-    print("\n📊 Reconstruction Metrics:")
-
-    if is_stereo and len(original.shape) > 1:
-        original_mono = np.mean(original, axis=1)
-        synth_mono = np.mean(synthesized, axis=1) if len(synthesized.shape) > 1 else synthesized
-    else:
-        original_mono = original.flatten()
-        synth_mono = synthesized.flatten()
-
-    original_rms = np.sqrt(np.mean(original_mono**2))
-    synth_rms = np.sqrt(np.mean(synth_mono**2))
-    print(f"   Original RMS: {original_rms:.6f}")
-    print(f"   Synthesized RMS: {synth_rms:.6f}")
-    print(f"   Amplitude ratio: {synth_rms/original_rms:.2f}x")
-
-    residual = original_mono - synth_mono
-    residual_power = np.mean(residual**2)
-    signal_power = np.mean(original_mono**2)
-    if residual_power > 0 and signal_power > 0:
-        snr_db = 10 * np.log10(signal_power / residual_power)
-        print(f"   SNR: {snr_db:.1f} dB")
-        print(f"   Reconstruction: {(1 - residual_power/signal_power)*100:.1f}%")
-
-    # Save
-    max_val = np.max(np.abs(synthesized))
-    if max_val > 0:
-        synthesized = synthesized / max_val * 0.95
-
-    output_file = audio_file.replace('.wav', '_synthesized_multiband.wav')
-    sf.write(output_file, synthesized, extractor.sample_rate)
-    print(f"\n✓ Saved synthesized audio to {output_file}")
-    print(f"✓ Saved track data to {h5_file}")
+    print(f"\n✓ Band extraction complete")
