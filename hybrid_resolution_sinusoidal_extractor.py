@@ -401,81 +401,133 @@ class HybridResolutionSinusoidalExtractor:
         return processed_tracks
 
     def save_to_hdf5(self, filename, all_channel_tracks, is_stereo, audio_file=None):
-        """Save extracted tracks to HDF5 with progress bar"""
+        """Save extracted tracks to HDF5 (compact binary format)"""
         print(f"\n💾 Saving to HDF5: {filename}")
 
         total_tracks = sum(len(tracks) for tracks in all_channel_tracks)
 
         with h5py.File(filename, 'w') as f:
-            meta = f.create_group('metadata')
-            meta.attrs['sample_rate'] = self.sample_rate
-            meta.attrs['freq_fft_size'] = self.freq_fft_size
-            meta.attrs['freq_hop_size'] = self.freq_hop_size
-            meta.attrs['is_stereo'] = is_stereo
-            meta.attrs['n_channels'] = len(all_channel_tracks)
-            if audio_file:
-                meta.attrs['source_file'] = audio_file
+            # Global metadata as attributes
+            f.attrs['sr'] = np.int32(self.sample_rate)
+            f.attrs['fft'] = np.int32(self.freq_fft_size)
+            f.attrs['hop'] = np.int32(self.freq_hop_size)
+            f.attrs['stereo'] = np.uint8(1 if is_stereo else 0)
+            f.attrs['ch'] = np.uint8(len(all_channel_tracks))
 
-            pbar = tqdm(total=total_tracks, desc="   Saving tracks")
             for ch_idx, tracks in enumerate(all_channel_tracks):
-                channel_group = f.create_group(f'channel_{ch_idx}')
-                channel_group.attrs['n_tracks'] = len(tracks)
+                if len(tracks) == 0:
+                    continue
 
-                for track_idx, track in enumerate(tracks):
-                    track_group = channel_group.create_group(f'track_{track_idx}')
+                # Pack all track data into contiguous arrays
+                track_lens = []
+                track_ids = []
+                track_starts = []
+                track_ends = []
+                track_bands = []
+                track_hops = []
 
-                    track_group.create_dataset('id', data=track['id'])
-                    track_group.create_dataset('start_frame', data=track['start_frame'])
-                    track_group.create_dataset('end_frame', data=track['end_frame'])
-                    track_group.create_dataset('frequencies', data=track['frequencies'])
-                    track_group.create_dataset('phases', data=track['phases'])
-                    track_group.create_dataset('freq_frame_indices', data=track['freq_frame_indices'])
-                    track_group.create_dataset('freq_times', data=track['freq_times'])
-                    track_group.create_dataset('amplitudes', data=track['amplitudes'])
-                    track_group.create_dataset('amp_times', data=track['amp_times'])
-                    track_group.attrs['hop_size'] = track['hop_size']
+                all_freqs = []
+                all_phases = []
+                all_amps = []
+                all_indices = []
 
-                    pbar.update(1)
+                for track in tqdm(tracks, desc=f"   Ch {ch_idx} packing", leave=False):
+                    n = len(track['frequencies'])
+                    track_lens.append(n)
+                    track_ids.append(track['id'])
+                    track_starts.append(track['start_frame'])
+                    track_ends.append(track['end_frame'])
+                    track_bands.append(track.get('band', 0))
+                    track_hops.append(track['hop_size'])
 
-            pbar.close()
+                    all_freqs.extend(track['frequencies'])
+                    all_phases.extend(track['phases'])
+                    all_amps.extend(track['amplitudes'])
+                    all_indices.extend(track['freq_frame_indices'])
 
-        print(f"   ✓ Saved {total_tracks} total tracks")
+                # Store as compressed datasets (gzip level 9)
+                grp = f.create_group(f'c{ch_idx}')
+                grp.create_dataset('len', data=np.array(track_lens, dtype=np.int32), compression='gzip', compression_opts=9)
+                grp.create_dataset('id', data=np.array(track_ids, dtype=np.int32), compression='gzip', compression_opts=9)
+                grp.create_dataset('s', data=np.array(track_starts, dtype=np.int32), compression='gzip', compression_opts=9)
+                grp.create_dataset('e', data=np.array(track_ends, dtype=np.int32), compression='gzip', compression_opts=9)
+                grp.create_dataset('b', data=np.array(track_bands, dtype=np.uint8), compression='gzip', compression_opts=9)
+                grp.create_dataset('h', data=np.array(track_hops, dtype=np.int16), compression='gzip', compression_opts=9)
+
+                grp.create_dataset('f', data=np.array(all_freqs, dtype=np.float32), compression='gzip', compression_opts=9)
+                grp.create_dataset('p', data=np.array(all_phases, dtype=np.float32), compression='gzip', compression_opts=9)
+                grp.create_dataset('a', data=np.array(all_amps, dtype=np.float32), compression='gzip', compression_opts=9)
+                grp.create_dataset('i', data=np.array(all_indices, dtype=np.int32), compression='gzip', compression_opts=9)
+
+        import os
+        size_mb = os.path.getsize(filename) / (1024 * 1024)
+        print(f"   ✓ Saved {total_tracks} tracks ({size_mb:.2f} MB)")
 
     def load_from_hdf5(self, filename):
-        """Load tracks from HDF5 file"""
+        """Load tracks from HDF5 file (compact binary format)"""
         print(f"\n📂 Loading from HDF5: {filename}")
 
         all_channel_tracks = []
 
         with h5py.File(filename, 'r') as f:
-            meta = f['metadata']
-            is_stereo = meta.attrs['is_stereo']
-            n_channels = meta.attrs['n_channels']
+            # Read global metadata
+            sample_rate = int(f.attrs['sr'])
+            is_stereo = bool(f.attrs['stereo'])
+            n_channels = int(f.attrs['ch'])
 
-            print(f"   Sample rate: {meta.attrs['sample_rate']} Hz")
+            print(f"   Sample rate: {sample_rate} Hz")
             print(f"   Channels: {n_channels}")
 
             for ch_idx in range(n_channels):
-                channel_group = f[f'channel_{ch_idx}']
-                n_tracks = channel_group.attrs['n_tracks']
+                grp_name = f'c{ch_idx}'
+                if grp_name not in f:
+                    all_channel_tracks.append([])
+                    continue
 
+                grp = f[grp_name]
+
+                # Read packed arrays
+                track_lens = grp['len'][:]
+                track_ids = grp['id'][:]
+                track_starts = grp['s'][:]
+                track_ends = grp['e'][:]
+                track_bands = grp['b'][:]
+                track_hops = grp['h'][:]
+
+                all_freqs = grp['f'][:]
+                all_phases = grp['p'][:]
+                all_amps = grp['a'][:]
+                all_indices = grp['i'][:]
+
+                # Unpack into individual tracks
                 tracks = []
-                for track_idx in range(n_tracks):
-                    track_group = channel_group[f'track_{track_idx}']
+                offset = 0
+                for i, n in enumerate(track_lens):
+                    frequencies = all_freqs[offset:offset+n].tolist()
+                    phases = all_phases[offset:offset+n].tolist()
+                    amplitudes = all_amps[offset:offset+n].tolist()
+                    indices = all_indices[offset:offset+n].tolist()
+
+                    # Reconstruct times from indices and hop size
+                    hop_size = int(track_hops[i])
+                    band_sr = 12000  # bandwidth * 2
+                    times = (np.array(indices) * hop_size / band_sr).tolist()
 
                     track = {
-                        'id': int(track_group['id'][()]),
-                        'start_frame': int(track_group['start_frame'][()]),
-                        'end_frame': int(track_group['end_frame'][()]),
-                        'frequencies': track_group['frequencies'][:].tolist(),
-                        'phases': track_group['phases'][:].tolist(),
-                        'freq_frame_indices': track_group['freq_frame_indices'][:].tolist(),
-                        'freq_times': track_group['freq_times'][:].tolist(),
-                        'amplitudes': track_group['amplitudes'][:].tolist(),
-                        'amp_times': track_group['amp_times'][:].tolist(),
-                        'hop_size': track_group.attrs['hop_size']
+                        'id': int(track_ids[i]),
+                        'start_frame': int(track_starts[i]),
+                        'end_frame': int(track_ends[i]),
+                        'band': int(track_bands[i]),
+                        'frequencies': frequencies,
+                        'phases': phases,
+                        'freq_frame_indices': indices,
+                        'freq_times': times,
+                        'amplitudes': amplitudes,
+                        'amp_times': times,
+                        'hop_size': hop_size
                     }
                     tracks.append(track)
+                    offset += n
 
                 all_channel_tracks.append(tracks)
                 print(f"   Channel {ch_idx}: {len(tracks)} tracks")
