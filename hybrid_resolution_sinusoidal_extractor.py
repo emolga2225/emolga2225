@@ -592,67 +592,130 @@ class HybridResolutionSinusoidalExtractor:
     def synthesize_channel(self, tracks, n_samples):
         print(f"   Synthesizing {len(tracks)} tracks...")
 
-        synthesized = np.zeros(n_samples)
+        if self.use_gpu:
+            # GPU-accelerated synthesis
+            synthesized_gpu = torch.zeros(n_samples, dtype=torch.float32, device=self.device)
 
-        for track in tqdm(tracks, desc="   Progress"):
-            freq_times = np.array(track['freq_times'])
-            frequencies = np.array(track['frequencies'])
-            amp_times = np.array(track['amp_times'])
-            amplitudes = np.array(track['amplitudes'])
-            phases = np.array(track['phases'])
+            for track in tqdm(tracks, desc="   Progress"):
+                freq_times = np.array(track['freq_times'])
+                frequencies = np.array(track['frequencies'])
+                amp_times = np.array(track['amp_times'])
+                amplitudes = np.array(track['amplitudes'])
+                phases = np.array(track['phases'])
 
-            if len(freq_times) < 1 or len(amplitudes) < 1:
-                continue
+                if len(freq_times) < 1 or len(amplitudes) < 1:
+                    continue
 
-            # Use exact birth/death times
-            birth_time = freq_times[0]
-            death_time = freq_times[-1]
+                # Use exact birth/death times
+                birth_time = freq_times[0]
+                death_time = freq_times[-1]
 
-            birth_sample = int(birth_time * self.sample_rate)
-            death_sample = int(death_time * self.sample_rate)
+                birth_sample = int(birth_time * self.sample_rate)
+                death_sample = int(death_time * self.sample_rate)
 
-            birth_sample = max(0, birth_sample)
-            death_sample = min(n_samples - 1, death_sample)
+                birth_sample = max(0, birth_sample)
+                death_sample = min(n_samples - 1, death_sample)
 
-            if birth_sample >= death_sample:
-                continue
+                if birth_sample >= death_sample:
+                    continue
 
-            n_sinusoid_samples = death_sample - birth_sample + 1
-            t = np.arange(n_sinusoid_samples) / self.sample_rate + birth_time
+                n_sinusoid_samples = death_sample - birth_sample + 1
+                t = np.arange(n_sinusoid_samples) / self.sample_rate + birth_time
 
-            # Interpolate frequency
-            if len(freq_times) == 1:
-                freq_values = np.full(n_sinusoid_samples, frequencies[0])
-            else:
-                freq_interp = interp1d(freq_times, frequencies, kind='nearest',
-                                    bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
-                freq_values = freq_interp(t)
+                # Interpolate frequency (on CPU, then transfer to GPU)
+                if len(freq_times) == 1:
+                    freq_values = np.full(n_sinusoid_samples, frequencies[0])
+                else:
+                    freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+                                        bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
+                    freq_values = freq_interp(t)
 
-            # Interpolate amplitude
-            if len(amp_times) == 1:
-                amp_values = np.full(n_sinusoid_samples, amplitudes[0])
-            else:
-                amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
-                amp_values = np.maximum(amp_values, 0)
+                # Interpolate amplitude (on CPU, then transfer to GPU)
+                if len(amp_times) == 1:
+                    amp_values = np.full(n_sinusoid_samples, amplitudes[0])
+                else:
+                    amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
+                    amp_values = np.maximum(amp_values, 0)
 
-            # Phase integration
-            initial_phase = phases[0]
-            dt = 1.0 / self.sample_rate
-            phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
+                # Transfer to GPU
+                freq_values_gpu = torch.from_numpy(freq_values).float().to(self.device)
+                amp_values_gpu = torch.from_numpy(amp_values).float().to(self.device)
 
-            # Synthesize (no fades!)
-            sinusoid = amp_values * np.sin(phase)
+                # Phase integration on GPU
+                initial_phase = phases[0]
+                dt = 1.0 / self.sample_rate
+                phase = initial_phase + 2 * np.pi * torch.cumsum(freq_values_gpu * dt, dim=0)
 
-            # Add to output
-            synthesized[birth_sample:death_sample+1] += sinusoid
+                # Synthesize on GPU
+                sinusoid = amp_values_gpu * torch.sin(phase)
 
-        print(f"   ✓ Complete")
-        return synthesized
+                # Add to output
+                synthesized_gpu[birth_sample:death_sample+1] += sinusoid
+
+            print(f"   ✓ Complete")
+            return synthesized_gpu.cpu().numpy()
+
+        else:
+            # CPU synthesis
+            synthesized = np.zeros(n_samples)
+
+            for track in tqdm(tracks, desc="   Progress"):
+                freq_times = np.array(track['freq_times'])
+                frequencies = np.array(track['frequencies'])
+                amp_times = np.array(track['amp_times'])
+                amplitudes = np.array(track['amplitudes'])
+                phases = np.array(track['phases'])
+
+                if len(freq_times) < 1 or len(amplitudes) < 1:
+                    continue
+
+                # Use exact birth/death times
+                birth_time = freq_times[0]
+                death_time = freq_times[-1]
+
+                birth_sample = int(birth_time * self.sample_rate)
+                death_sample = int(death_time * self.sample_rate)
+
+                birth_sample = max(0, birth_sample)
+                death_sample = min(n_samples - 1, death_sample)
+
+                if birth_sample >= death_sample:
+                    continue
+
+                n_sinusoid_samples = death_sample - birth_sample + 1
+                t = np.arange(n_sinusoid_samples) / self.sample_rate + birth_time
+
+                # Interpolate frequency
+                if len(freq_times) == 1:
+                    freq_values = np.full(n_sinusoid_samples, frequencies[0])
+                else:
+                    freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+                                        bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
+                    freq_values = freq_interp(t)
+
+                # Interpolate amplitude
+                if len(amp_times) == 1:
+                    amp_values = np.full(n_sinusoid_samples, amplitudes[0])
+                else:
+                    amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
+                    amp_values = np.maximum(amp_values, 0)
+
+                # Phase integration
+                initial_phase = phases[0]
+                dt = 1.0 / self.sample_rate
+                phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
+
+                # Synthesize (no fades!)
+                sinusoid = amp_values * np.sin(phase)
+
+                # Add to output
+                synthesized[birth_sample:death_sample+1] += sinusoid
+
+            print(f"   ✓ Complete")
+            return synthesized
 
     def synthesize_single_track(self, track, n_samples):
         """Synthesize a single track into audio"""
-        synthesized = np.zeros(n_samples)
-
         freq_times = np.array(track['freq_times'])
         frequencies = np.array(track['frequencies'])
         amp_times = np.array(track['amp_times'])
@@ -660,7 +723,7 @@ class HybridResolutionSinusoidalExtractor:
         phases = np.array(track['phases'])
 
         if len(freq_times) < 1 or len(amplitudes) < 1:
-            return synthesized
+            return np.zeros(n_samples)
 
         # Use exact birth/death times
         birth_time = freq_times[0]
@@ -673,7 +736,7 @@ class HybridResolutionSinusoidalExtractor:
         death_sample = min(n_samples - 1, death_sample)
 
         if birth_sample >= death_sample:
-            return synthesized
+            return np.zeros(n_samples)
 
         n_sinusoid_samples = death_sample - birth_sample + 1
         t = np.arange(n_sinusoid_samples) / self.sample_rate + birth_time
@@ -693,18 +756,38 @@ class HybridResolutionSinusoidalExtractor:
             amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
             amp_values = np.maximum(amp_values, 0)
 
-        # Phase integration
-        initial_phase = phases[0]
-        dt = 1.0 / self.sample_rate
-        phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
+        if self.use_gpu:
+            # GPU-accelerated synthesis
+            freq_values_gpu = torch.from_numpy(freq_values).float().to(self.device)
+            amp_values_gpu = torch.from_numpy(amp_values).float().to(self.device)
 
-        # Synthesize
-        sinusoid = amp_values * np.sin(phase)
+            # Phase integration on GPU
+            initial_phase = phases[0]
+            dt = 1.0 / self.sample_rate
+            phase = initial_phase + 2 * np.pi * torch.cumsum(freq_values_gpu * dt, dim=0)
 
-        # Add to output
-        synthesized[birth_sample:death_sample+1] += sinusoid
+            # Synthesize on GPU
+            sinusoid = amp_values_gpu * torch.sin(phase)
+            sinusoid_cpu = sinusoid.cpu().numpy()
 
-        return synthesized
+            # Add to output
+            synthesized = np.zeros(n_samples)
+            synthesized[birth_sample:death_sample+1] += sinusoid_cpu
+            return synthesized
+        else:
+            # CPU synthesis
+            # Phase integration
+            initial_phase = phases[0]
+            dt = 1.0 / self.sample_rate
+            phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
+
+            # Synthesize
+            sinusoid = amp_values * np.sin(phase)
+
+            # Add to output
+            synthesized = np.zeros(n_samples)
+            synthesized[birth_sample:death_sample+1] += sinusoid
+            return synthesized
 
     def export_tracks_as_wav(self, all_channel_tracks, n_samples, output_dir="tracks"):
         """Export individual sinusoidal tracks as WAV files"""
