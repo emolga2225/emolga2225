@@ -145,17 +145,24 @@ class HybridResolutionSinusoidalExtractor:
 
             rms_original = np.sqrt(np.mean(band_signal**2))
 
-            # Step 2: Frequency-shift to 0-6kHz window (keep same sample rate)
-            # Shift down by low_freq so band starts at 0 Hz
-            t = np.arange(len(band_signal)) / self.sample_rate
+            # Step 2: Frequency-shift to 0-6kHz window (skip band 0, already at baseband)
+            if low_freq == 0:
+                # Band 0 already starts at 0 Hz, no shift needed
+                band_baseband = band_signal
+                rms_baseband = rms_original
+                print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms_original:.6f} (already at baseband)")
+            else:
+                # Shift down by low_freq so band starts at 0 Hz
+                t = np.arange(len(band_signal)) / self.sample_rate
 
-            # Complex demodulation - shift by low_freq
-            shifted = band_signal * np.exp(-1j * 2 * np.pi * low_freq * t)
+                # Complex demodulation - shift by low_freq
+                shifted = band_signal * np.exp(-1j * 2 * np.pi * low_freq * t)
 
-            # Take real part (baseband signal at original sample rate)
-            band_baseband = np.real(shifted)
+                # Take real part (baseband signal at original sample rate)
+                band_baseband = np.real(shifted)
 
-            rms_baseband = np.sqrt(np.mean(band_baseband**2))
+                rms_baseband = np.sqrt(np.mean(band_baseband**2))
+                print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms_original:.6f} (orig) / {rms_baseband:.6f} (shifted)")
 
             # Export original band at full sample rate
             band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_orig.wav")
@@ -164,8 +171,6 @@ class HybridResolutionSinusoidalExtractor:
             # Export frequency-shifted band (still at original sample rate)
             band_baseband_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_shifted.wav")
             sf.write(band_baseband_filename, band_baseband, self.sample_rate)
-
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms_original:.6f} (orig) / {rms_baseband:.6f} (shifted)")
 
             band_signals.append((low_freq, high_freq, band_signal, band_baseband))
 
