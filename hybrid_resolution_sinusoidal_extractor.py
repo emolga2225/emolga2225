@@ -135,48 +135,46 @@ class HybridResolutionSinusoidalExtractor:
 
         print(f"   Created {len(bands)} overlapping bands (50% overlap, {base_bandwidth/1000:.1f} kHz width)")
 
-        # Create band-limited signals using downsampling methodology
+        # Create band-limited signals using Butterworth bandpass filters
+        from scipy.signal import butter, filtfilt
+
         band_signals = []
 
         for low_freq, high_freq in bands:
-            # Downsample to just above high_freq
-            target_sample_rate = high_freq * 2
+            # Design bandpass filter
+            nyq = self.sample_rate / 2
 
-            if target_sample_rate >= self.sample_rate:
-                # No downsampling needed
-                highpass_signal = audio_mono.copy()
+            # Handle edge cases for filter design
+            if low_freq <= 0:
+                # Lowpass only
+                low_normalized = high_freq / nyq
+                if low_normalized >= 1.0:
+                    band_signal = audio_mono.copy()
+                else:
+                    b, a = butter(4, low_normalized, btype='low')
+                    band_signal = filtfilt(b, a, audio_mono)
+            elif high_freq >= nyq:
+                # Highpass only
+                high_normalized = low_freq / nyq
+                if high_normalized >= 1.0:
+                    band_signal = np.zeros_like(audio_mono)
+                else:
+                    b, a = butter(4, high_normalized, btype='high')
+                    band_signal = filtfilt(b, a, audio_mono)
             else:
-                # Downsample and upsample to lowpass filter
-                decimation_factor = self.sample_rate / target_sample_rate
-                up = 1
-                down = int(decimation_factor)
+                # Bandpass
+                low_normalized = low_freq / nyq
+                high_normalized = high_freq / nyq
 
-                downsampled = resample_poly(audio_mono, up, down)
-                highpass_signal = resample_poly(downsampled, down, up)
+                # Clamp to valid range
+                low_normalized = max(0.0001, min(0.9999, low_normalized))
+                high_normalized = max(0.0001, min(0.9999, high_normalized))
 
-                if len(highpass_signal) > len(audio_mono):
-                    highpass_signal = highpass_signal[:len(audio_mono)]
-                elif len(highpass_signal) < len(audio_mono):
-                    highpass_signal = np.pad(highpass_signal, (0, len(audio_mono) - len(highpass_signal)))
-
-            # Now highpass by subtracting lower band
-            if low_freq > 0:
-                low_target_sr = low_freq * 2
-                low_decimation = self.sample_rate / low_target_sr
-                low_up = 1
-                low_down = int(low_decimation)
-
-                low_downsampled = resample_poly(audio_mono, low_up, low_down)
-                lowpass_signal = resample_poly(low_downsampled, low_down, low_up)
-
-                if len(lowpass_signal) > len(audio_mono):
-                    lowpass_signal = lowpass_signal[:len(audio_mono)]
-                elif len(lowpass_signal) < len(audio_mono):
-                    lowpass_signal = np.pad(lowpass_signal, (0, len(audio_mono) - len(lowpass_signal)))
-
-                band_signal = highpass_signal - lowpass_signal
-            else:
-                band_signal = highpass_signal
+                if high_normalized > low_normalized:
+                    b, a = butter(4, [low_normalized, high_normalized], btype='band')
+                    band_signal = filtfilt(b, a, audio_mono)
+                else:
+                    band_signal = np.zeros_like(audio_mono)
 
             rms = np.sqrt(np.mean(band_signal**2))
             print(f"   Band {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz: RMS={rms:.6f}")
