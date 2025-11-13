@@ -182,13 +182,27 @@ class HybridResolutionSinusoidalExtractor:
 
             rms = np.sqrt(np.mean(band_signal**2))
 
-            # Downsample to match bandwidth (same for all bands)
+            # Shift band to baseband before downsampling
+            # Band at low_freq-high_freq → shift to 0-bandwidth
             if band_sample_rate < self.sample_rate:
+                # Frequency shift down by low_freq (move to baseband)
+                t = np.arange(len(band_signal)) / self.sample_rate
+                shift_freq = low_freq + bandwidth / 2  # Shift by center frequency
+
+                # Complex demodulation (shift to baseband)
+                analytic_signal = band_signal * np.exp(-1j * 2 * np.pi * shift_freq * t)
+
+                # Downsample the complex signal
                 g = gcd(int(self.sample_rate), band_sample_rate)
                 up = band_sample_rate // g
                 down = int(self.sample_rate) // g
 
-                band_downsampled = resample_poly(band_signal, up, down)
+                # Resample real and imaginary parts
+                real_down = resample_poly(np.real(analytic_signal), up, down)
+                imag_down = resample_poly(np.imag(analytic_signal), up, down)
+
+                # Recombine and take real part (imaginary should be ~0 for baseband)
+                band_downsampled = np.real(real_down + 1j * imag_down)
             else:
                 band_downsampled = band_signal
 
