@@ -163,16 +163,31 @@ class HybridResolutionSinusoidalExtractor:
 
                 downsampled_versions[edge_freq] = upsampled
 
-        # Create bands by subtracting pre-computed versions
+        # Create bands by subtracting pre-computed versions and export as WAV
         # This preserves phase relationships and avoids cancellation
-        band_signals = []
+        print("   Exporting bands as WAV files...")
 
-        for low_freq, high_freq in bands:
+        import os
+        band_dir = "bands"
+        os.makedirs(band_dir, exist_ok=True)
+
+        band_signals = []
+        band_files = []
+
+        for band_idx, (low_freq, high_freq) in enumerate(bands):
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
-            print(f"   Band {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz: RMS={rms:.6f}")
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
+
+            # Export band as WAV
+            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
+            sf.write(band_filename, band_signal, self.sample_rate)
+
             band_signals.append((low_freq, high_freq, band_signal))
+            band_files.append(band_filename)
+
+        print(f"   ✓ Exported {len(band_files)} band WAV files to {band_dir}/")
 
         # Process each band independently with synchrosqueezed STFT
         print("   Processing bands with synchrosqueezed STFT...")
