@@ -104,36 +104,28 @@ class HybridResolutionSinusoidalExtractor:
 
     def extract_with_overlapping_bands(self, audio_mono):
         """
-        Extract sinusoidal tracks using overlapping bands with synchrosqueeze-inspired reassignment.
-
-        Philosophy: Like synchrosqueeze exploits TF redundancy to sharpen localization,
-        we exploit band overlap redundancy to assign components to their most sparse representation.
+        Extract sinusoidal tracks using multi-band analysis with exact decimation.
         """
         from scipy.signal import resample_poly
         from ssqueezepy import ssq_stft
         from scipy.optimize import linear_sum_assignment
 
-        print("   Computing overlapping multi-band analysis (synchrosqueeze-inspired)...")
+        print("   Computing multi-band analysis...")
 
         nyquist = self.sample_rate / 2
 
-        # Overlapping bands with 50% overlap (sliding window style)
-        base_bandwidth = 6000  # 6 kHz base bandwidth
-        overlap_factor = 0.5    # 50% overlap
-        step = base_bandwidth * (1 - overlap_factor)  # 3 kHz step
+        # Fixed number of bands: 16 for 192kHz (scales with sample rate)
+        # This gives ~6kHz bandwidth per band for 192kHz
+        n_bands = 16
+        bandwidth = nyquist / n_bands
 
         bands = []
-        low_freq = 0
+        for i in range(n_bands):
+            low_freq = i * bandwidth
+            high_freq = (i + 1) * bandwidth
+            bands.append((low_freq, high_freq))
 
-        while low_freq < nyquist:
-            high_freq = min(nyquist, low_freq + base_bandwidth)
-
-            if high_freq > low_freq:  # Only add non-empty bands
-                bands.append((low_freq, high_freq))
-
-            low_freq += step
-
-        print(f"   Created {len(bands)} overlapping bands (50% overlap, {base_bandwidth/1000:.1f} kHz width)")
+        print(f"   Created {len(bands)} non-overlapping bands ({bandwidth/1000:.1f} kHz width)")
 
         # Collect all unique edge frequencies
         edge_freqs = sorted(set([low for low, high in bands] + [high for low, high in bands]))
@@ -182,10 +174,11 @@ class HybridResolutionSinusoidalExtractor:
             print(f"   Band {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz: RMS={rms:.6f}")
             band_signals.append((low_freq, high_freq, band_signal))
 
-        # Extract peaks from all bands
-        print("   Extracting peaks from overlapping bands with synchrosqueezed STFT...")
+        # Process each band independently with synchrosqueezed STFT
+        print("   Processing bands with synchrosqueezed STFT...")
 
-        all_candidate_peaks = []  # Will store peaks from all bands with metadata
+        all_band_tracks = []
+        global_track_id = 0
         ssq_hop = 16
 
         for band_idx, (low_freq, high_freq, band_signal) in enumerate(tqdm(band_signals, desc="   Analyzing bands")):
@@ -207,13 +200,17 @@ class HybridResolutionSinusoidalExtractor:
 
             n_freq_bins, n_time_frames = Sx.shape
 
-            # Extract peaks for this band
+            # Extract peaks from each frame
+            ssq_peaks = []
+
             for frame_idx in range(n_time_frames):
                 frame_tx = tx_mag[:, frame_idx]
                 frame_sx = sx_mag[:, frame_idx]
                 frame_phase = sx_phase[:, frame_idx]
 
                 peaks_idx, _ = find_peaks(frame_tx, distance=1)
+
+                peaks = []
 
                 for idx in peaks_idx[:self.max_peaks]:
                     if ssq_freqs.ndim == 1:
@@ -230,158 +227,107 @@ class HybridResolutionSinusoidalExtractor:
 
                     amp = frame_sx[idx]
                     phase = frame_phase[idx]
-                    sharpness = frame_tx[idx]  # Synchrosqueezed magnitude (sharper)
 
-                    # Store candidate peak with band information
-                    all_candidate_peaks.append({
+                    peaks.append({
                         'frequency': freq,
                         'amplitude': amp,
                         'phase': phase,
-                        'sharpness': sharpness,  # Higher = more localized
-                        'frame_idx': frame_idx,
-                        'band_idx': band_idx,
-                        'band_center': (low_freq + high_freq) / 2,
-                        'band_range': (low_freq, high_freq)
+                        'bin': idx
                     })
 
-        print(f"   Extracted {len(all_candidate_peaks)} candidate peaks from all bands")
+                peaks.sort(key=lambda x: x['amplitude'], reverse=True)
+                ssq_peaks.append(peaks)
 
-        # Reassignment: Group by (frame, frequency) and pick best representation
-        print("   Applying synchrosqueeze-style reassignment across bands...")
+            # Track peaks over time using Hungarian algorithm
+            active_tracks = []
 
-        # Group peaks by frame
-        from collections import defaultdict
-        peaks_by_frame = defaultdict(list)
+            for frame_idx, frame_peaks in enumerate(ssq_peaks):
+                if len(active_tracks) == 0:
+                    for peak in frame_peaks[:self.max_peaks]:
+                        new_track = {
+                            'id': global_track_id,
+                            'band': band_idx,
+                            'start_frame': frame_idx,
+                            'end_frame': frame_idx,
+                            'frequencies': [peak['frequency']],
+                            'amplitudes': [peak['amplitude']],
+                            'phases': [peak['phase']],
+                            'freq_frame_indices': [frame_idx]
+                        }
+                        active_tracks.append(new_track)
+                        global_track_id += 1
+                    continue
 
-        for peak in all_candidate_peaks:
-            peaks_by_frame[peak['frame_idx']].append(peak)
+                if len(frame_peaks) == 0:
+                    for track in active_tracks:
+                        track['frequencies'].append(track['frequencies'][-1])
+                        track['amplitudes'].append(0.0)
+                        track['phases'].append(track['phases'][-1])
+                        track['freq_frame_indices'].append(frame_idx)
+                        track['end_frame'] = frame_idx
+                    continue
 
-        # For each frame, deduplicate overlapping peaks
-        reassigned_peaks_by_frame = []
+                # Hungarian matching
+                n_tracks = len(active_tracks)
+                n_peaks = len(frame_peaks)
 
-        for frame_idx in sorted(peaks_by_frame.keys()):
-            frame_peaks = peaks_by_frame[frame_idx]
+                LARGE_COST = 1e10
+                cost_matrix = np.full((n_tracks, n_peaks), LARGE_COST)
 
-            # Sort by frequency
-            frame_peaks.sort(key=lambda p: p['frequency'])
+                for i, track in enumerate(active_tracks):
+                    freq_pred = track['frequencies'][-1]
+                    for j, peak in enumerate(frame_peaks):
+                        cost_matrix[i, j] = abs(peak['frequency'] - freq_pred)
 
-            # Merge peaks that are close in frequency (from different bands)
-            merged_peaks = []
-            freq_tolerance = 50  # Hz - peaks within this are considered "same" component
+                track_indices, peak_indices = linear_sum_assignment(cost_matrix)
 
-            i = 0
-            while i < len(frame_peaks):
-                current = frame_peaks[i]
-                candidates = [current]
+                matched_peaks = set()
+                matched_tracks = set()
 
-                # Collect all peaks within frequency tolerance
-                j = i + 1
-                while j < len(frame_peaks) and frame_peaks[j]['frequency'] - current['frequency'] < freq_tolerance:
-                    candidates.append(frame_peaks[j])
-                    j += 1
+                for track_idx, peak_idx in zip(track_indices, peak_indices):
+                    if cost_matrix[track_idx, peak_idx] < LARGE_COST:
+                        track = active_tracks[track_idx]
+                        peak = frame_peaks[peak_idx]
 
-                # Pick the peak with highest sharpness (most localized in SST)
-                # This is the synchrosqueeze philosophy: use redundancy to find sparsest representation
-                best_peak = max(candidates, key=lambda p: p['sharpness'])
-                merged_peaks.append(best_peak)
+                        track['frequencies'].append(peak['frequency'])
+                        track['amplitudes'].append(peak['amplitude'])
+                        track['phases'].append(peak['phase'])
+                        track['freq_frame_indices'].append(frame_idx)
+                        track['end_frame'] = frame_idx
 
-                i = j
+                        matched_peaks.add(peak_idx)
+                        matched_tracks.add(track_idx)
 
-            reassigned_peaks_by_frame.append(merged_peaks)
+                for i, track in enumerate(active_tracks):
+                    if i not in matched_tracks:
+                        track['frequencies'].append(track['frequencies'][-1])
+                        track['amplitudes'].append(0.0)
+                        track['phases'].append(track['phases'][-1])
+                        track['freq_frame_indices'].append(frame_idx)
+                        track['end_frame'] = frame_idx
 
-        print(f"   After reassignment: {sum(len(p) for p in reassigned_peaks_by_frame)} unique peaks")
-
-        # Now track these reassigned peaks over time
-        print("   Tracking reassigned peaks over time...")
-
-        active_tracks = []
-        global_track_id = 0
-
-        for frame_idx, frame_peaks in enumerate(reassigned_peaks_by_frame):
-            if len(active_tracks) == 0:
-                for peak in frame_peaks[:self.max_peaks]:
-                    new_track = {
-                        'id': global_track_id,
-                        'band': peak['band_idx'],
-                        'start_frame': frame_idx,
-                        'end_frame': frame_idx,
-                        'frequencies': [peak['frequency']],
-                        'amplitudes': [peak['amplitude']],
-                        'phases': [peak['phase']],
-                        'freq_frame_indices': [frame_idx]
-                    }
-                    active_tracks.append(new_track)
-                    global_track_id += 1
-                continue
-
-            if len(frame_peaks) == 0:
-                for track in active_tracks:
-                    track['frequencies'].append(track['frequencies'][-1])
-                    track['amplitudes'].append(0.0)
-                    track['phases'].append(track['phases'][-1])
-                    track['freq_frame_indices'].append(frame_idx)
-                    track['end_frame'] = frame_idx
-                continue
-
-            # Hungarian matching
-            n_tracks = len(active_tracks)
-            n_peaks = len(frame_peaks)
-
-            LARGE_COST = 1e10
-            cost_matrix = np.full((n_tracks, n_peaks), LARGE_COST)
-
-            for i, track in enumerate(active_tracks):
-                freq_pred = track['frequencies'][-1]
                 for j, peak in enumerate(frame_peaks):
-                    cost_matrix[i, j] = abs(peak['frequency'] - freq_pred)
+                    if j not in matched_peaks and len(active_tracks) < self.max_peaks:
+                        new_track = {
+                            'id': global_track_id,
+                            'start_frame': frame_idx,
+                            'end_frame': frame_idx,
+                            'band': band_idx,
+                            'frequencies': [peak['frequency']],
+                            'amplitudes': [peak['amplitude']],
+                            'phases': [peak['phase']],
+                            'freq_frame_indices': [frame_idx]
+                        }
+                        active_tracks.append(new_track)
+                        global_track_id += 1
 
-            track_indices, peak_indices = linear_sum_assignment(cost_matrix)
+            all_band_tracks.extend(active_tracks)
 
-            matched_peaks = set()
-            matched_tracks = set()
-
-            for track_idx, peak_idx in zip(track_indices, peak_indices):
-                if cost_matrix[track_idx, peak_idx] < LARGE_COST:
-                    track = active_tracks[track_idx]
-                    peak = frame_peaks[peak_idx]
-
-                    track['frequencies'].append(peak['frequency'])
-                    track['amplitudes'].append(peak['amplitude'])
-                    track['phases'].append(peak['phase'])
-                    track['freq_frame_indices'].append(frame_idx)
-                    track['end_frame'] = frame_idx
-
-                    matched_peaks.add(peak_idx)
-                    matched_tracks.add(track_idx)
-
-            for i, track in enumerate(active_tracks):
-                if i not in matched_tracks:
-                    track['frequencies'].append(track['frequencies'][-1])
-                    track['amplitudes'].append(0.0)
-                    track['phases'].append(track['phases'][-1])
-                    track['freq_frame_indices'].append(frame_idx)
-                    track['end_frame'] = frame_idx
-
-            for j, peak in enumerate(frame_peaks):
-                if j not in matched_peaks and len(active_tracks) < self.max_peaks:
-                    new_track = {
-                        'id': global_track_id,
-                        'start_frame': frame_idx,
-                        'end_frame': frame_idx,
-                        'band': peak['band_idx'],
-                        'frequencies': [peak['frequency']],
-                        'amplitudes': [peak['amplitude']],
-                        'phases': [peak['phase']],
-                        'freq_frame_indices': [frame_idx]
-                    }
-                    active_tracks.append(new_track)
-                    global_track_id += 1
-
-        print(f"   Total tracks: {len(active_tracks)}")
+        print(f"   Total tracks: {len(all_band_tracks)}")
 
         # Post-process
         processed_tracks = []
-        for track in active_tracks:
+        for track in all_band_tracks:
             freq_times = np.array(track['freq_frame_indices']) * ssq_hop / self.sample_rate
 
             processed_track = {
@@ -399,7 +345,7 @@ class HybridResolutionSinusoidalExtractor:
             }
             processed_tracks.append(processed_track)
 
-        print(f"   ✓ Created {len(processed_tracks)} tracks (overlapping bands + synchrosqueeze reassignment)")
+        print(f"   ✓ Created {len(processed_tracks)} tracks (multi-band + synchrosqueeze)")
 
         return processed_tracks
 
@@ -581,7 +527,7 @@ if __name__ == "__main__":
     original, all_channel_tracks, is_stereo = extractor.analyze(audio_file)
 
     # Save to HDF5
-    h5_file = audio_file.replace('.wav', '_tracks_overlapping.h5')
+    h5_file = audio_file.replace('.wav', '_tracks_multiband.h5')
     extractor.save_to_hdf5(h5_file, all_channel_tracks, is_stereo, audio_file)
 
     # Synthesize
@@ -617,7 +563,7 @@ if __name__ == "__main__":
     if max_val > 0:
         synthesized = synthesized / max_val * 0.95
 
-    output_file = audio_file.replace('.wav', '_synthesized_overlapping.wav')
+    output_file = audio_file.replace('.wav', '_synthesized_multiband.wav')
     sf.write(output_file, synthesized, extractor.sample_rate)
     print(f"\n✓ Saved synthesized audio to {output_file}")
     print(f"✓ Saved track data to {h5_file}")
