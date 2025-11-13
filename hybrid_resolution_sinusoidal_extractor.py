@@ -186,8 +186,9 @@ class HybridResolutionSinusoidalExtractor:
                 band_restored = band_upsampled
             else:
                 t_up = np.arange(len(band_upsampled)) / self.sample_rate
-                # Shift back up by low_freq
-                band_restored = band_upsampled * np.cos(2 * np.pi * low_freq * t_up)
+                # Shift back up by low_freq using complex exponential (inverse of downshift)
+                shifted_up = band_upsampled * np.exp(1j * 2 * np.pi * low_freq * t_up)
+                band_restored = np.real(shifted_up)
 
             rms_restored = np.sqrt(np.mean(band_restored**2))
 
