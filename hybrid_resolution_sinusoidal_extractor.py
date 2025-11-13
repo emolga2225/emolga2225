@@ -88,7 +88,7 @@ class HybridResolutionSinusoidalExtractor:
         return stft
 
     def extract_with_bands(self, audio_mono):
-        """Extract bands based on sample rate (6kHz bandwidth per band)"""
+        """Extract bands based on sample rate and FFT size"""
         from scipy.signal import resample_poly
         from math import gcd
 
@@ -96,9 +96,8 @@ class HybridResolutionSinusoidalExtractor:
 
         nyquist = self.sample_rate / 2
 
-        # Calculate number of bands based on sample rate
-        # Each band has 6kHz bandwidth
-        bandwidth = 6000  # Hz
+        # Calculate bandwidth from FFT size (1024 = 6kHz, 512 = 3kHz, etc.)
+        bandwidth = self.freq_fft_size * (6000.0 / 1024.0)
         n_bands = int(nyquist / bandwidth)
 
         print(f"   Sample rate: {self.sample_rate} Hz")
@@ -505,8 +504,13 @@ class HybridResolutionSinusoidalExtractor:
         with h5py.File(filename, 'r') as f:
             # Read global metadata
             sample_rate = int(f.attrs['sr'])
+            fft_size = int(f.attrs['fft'])
             is_stereo = bool(f.attrs['stereo'])
             n_channels = int(f.attrs['ch'])
+
+            # Calculate bandwidth and band sample rate from FFT size
+            bandwidth = fft_size * (6000.0 / 1024.0)
+            band_sr = int(bandwidth * 2)
 
             print(f"   Sample rate: {sample_rate} Hz")
             print(f"   Channels: {n_channels}")
@@ -543,7 +547,6 @@ class HybridResolutionSinusoidalExtractor:
 
                     # Reconstruct times from indices and hop size
                     hop_size = int(track_hops[i])
-                    band_sr = 12000  # bandwidth * 2
                     times = (np.array(indices) * hop_size / band_sr).tolist()
 
                     track = {
