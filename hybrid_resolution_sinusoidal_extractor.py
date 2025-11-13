@@ -153,10 +153,15 @@ class HybridResolutionSinusoidalExtractor:
                 rms_baseband = rms_original
             else:
                 # Shift down by low_freq so band starts at 0 Hz
+                from scipy.signal import hilbert
+
+                # Create analytic signal (removes negative frequencies)
+                analytic = hilbert(band_signal)
+
                 t = np.arange(len(band_signal)) / self.sample_rate
 
-                # Complex demodulation - shift by low_freq
-                shifted = band_signal * np.exp(-1j * 2 * np.pi * low_freq * t)
+                # Frequency shift the analytic signal
+                shifted = analytic * np.exp(-1j * 2 * np.pi * low_freq * t)
 
                 # Take real part (baseband signal at original sample rate)
                 band_baseband = np.real(shifted)
@@ -185,9 +190,13 @@ class HybridResolutionSinusoidalExtractor:
             if low_freq == 0:
                 band_restored = band_upsampled
             else:
+                # Create analytic signal for upshift
+                analytic_up = hilbert(band_upsampled)
+
                 t_up = np.arange(len(band_upsampled)) / self.sample_rate
-                # Shift back up by low_freq using complex exponential (inverse of downshift)
-                shifted_up = band_upsampled * np.exp(1j * 2 * np.pi * low_freq * t_up)
+
+                # Shift back up by low_freq using analytic signal
+                shifted_up = analytic_up * np.exp(1j * 2 * np.pi * low_freq * t_up)
                 band_restored = np.real(shifted_up)
 
             rms_restored = np.sqrt(np.mean(band_restored**2))
