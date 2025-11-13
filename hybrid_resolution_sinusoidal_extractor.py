@@ -171,7 +171,27 @@ class HybridResolutionSinusoidalExtractor:
             band_downsampled = resample_poly(band_baseband, up, down)
             rms_downsampled = np.sqrt(np.mean(band_downsampled**2))
 
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms_original:.6f} -> {rms_downsampled:.6f} @ {band_sample_rate}Hz")
+            # Step 4: Reverse process - upsample and shift back to original frequency
+            # Upsample back to original sample rate
+            band_upsampled = resample_poly(band_downsampled, down, up)
+
+            # Match length to original
+            if len(band_upsampled) > len(band_signal):
+                band_upsampled = band_upsampled[:len(band_signal)]
+            elif len(band_upsampled) < len(band_signal):
+                band_upsampled = np.pad(band_upsampled, (0, len(band_signal) - len(band_upsampled)))
+
+            # Frequency-shift back up (skip band 0)
+            if low_freq == 0:
+                band_restored = band_upsampled
+            else:
+                t_up = np.arange(len(band_upsampled)) / self.sample_rate
+                # Shift back up by low_freq
+                band_restored = band_upsampled * np.cos(2 * np.pi * low_freq * t_up)
+
+            rms_restored = np.sqrt(np.mean(band_restored**2))
+
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms_original:.6f} -> {rms_downsampled:.6f} @ {band_sample_rate}Hz -> {rms_restored:.6f} (restored)")
 
             # Export original band at full sample rate
             band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_orig.wav")
@@ -180,6 +200,10 @@ class HybridResolutionSinusoidalExtractor:
             # Export downsampled shifted band
             band_baseband_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_shifted.wav")
             sf.write(band_baseband_filename, band_downsampled, band_sample_rate)
+
+            # Export restored band (pitched back up at original sample rate)
+            band_restored_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_restored.wav")
+            sf.write(band_restored_filename, band_restored, self.sample_rate)
 
             band_signals.append((low_freq, high_freq, band_signal, band_downsampled, band_sample_rate))
 
