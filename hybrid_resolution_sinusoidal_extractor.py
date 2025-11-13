@@ -220,9 +220,185 @@ class HybridResolutionSinusoidalExtractor:
         print(f"   ✓ Created {len(band_signals)} bands")
         print(f"   ✓ Exported {len(band_signals)} band WAV files to {band_dir}/")
 
-        # TODO: Process each band with synchrosqueeze (Step 2)
-        # For now, return empty tracks
-        return []
+        # Step 2: Process each downsampled band with synchrosqueeze
+        print("   Processing bands with synchrosqueeze STFT...")
+        from ssqueezepy import ssq_stft
+
+        all_tracks = []
+        global_track_id = 0
+        ssq_hop = 16
+
+        for band_idx, (low_freq, high_freq, band_signal, band_downsampled, band_sr) in enumerate(tqdm(band_signals, desc="   Analyzing bands")):
+
+            # Run synchrosqueezed STFT on downsampled band at band sample rate
+            Tx, Sx, ssq_freqs, Sfs = ssq_stft(
+                band_downsampled,
+                window='blackmanharris',
+                n_fft=self.freq_fft_size,
+                hop_len=ssq_hop,
+                fs=band_sr,  # Use band sample rate (12kHz)
+                modulated=True,
+                dtype='float64'
+            )
+
+            tx_mag = np.abs(Tx)
+            sx_mag = np.abs(Sx) * self.freq_scale
+            sx_phase = np.angle(Sx)
+
+            n_freq_bins, n_time_frames = Sx.shape
+
+            # Extract peaks from each frame
+            ssq_peaks = []
+
+            for frame_idx in range(n_time_frames):
+                frame_tx = tx_mag[:, frame_idx]
+                frame_sx = sx_mag[:, frame_idx]
+                frame_phase = sx_phase[:, frame_idx]
+
+                peaks_idx, _ = find_peaks(frame_tx, distance=1)
+
+                peaks = []
+
+                for idx in peaks_idx[:self.max_peaks]:
+                    if ssq_freqs.ndim == 1:
+                        freq_baseband = ssq_freqs[idx]
+                    else:
+                        freq_baseband = ssq_freqs[idx, 0]
+
+                    # Filter to baseband range (0 to bandwidth)
+                    if freq_baseband < 0 or freq_baseband > bandwidth:
+                        continue
+
+                    if np.isnan(freq_baseband) or freq_baseband >= band_sr / 2:
+                        continue
+
+                    # Shift frequency back to original band range
+                    freq_original = freq_baseband + low_freq
+
+                    amp = frame_sx[idx]
+                    phase = frame_phase[idx]
+
+                    peaks.append({
+                        'frequency': freq_original,  # Store in original frequency range
+                        'amplitude': amp,
+                        'phase': phase,
+                        'bin': idx
+                    })
+
+                peaks.sort(key=lambda x: x['amplitude'], reverse=True)
+                ssq_peaks.append(peaks)
+
+            # Track peaks over time using Hungarian algorithm
+            active_tracks = []
+
+            for frame_idx, frame_peaks in enumerate(ssq_peaks):
+                if len(active_tracks) == 0:
+                    for peak in frame_peaks[:self.max_peaks]:
+                        new_track = {
+                            'id': global_track_id,
+                            'band': band_idx,
+                            'start_frame': frame_idx,
+                            'end_frame': frame_idx,
+                            'frequencies': [peak['frequency']],
+                            'amplitudes': [peak['amplitude']],
+                            'phases': [peak['phase']],
+                            'freq_frame_indices': [frame_idx]
+                        }
+                        active_tracks.append(new_track)
+                        global_track_id += 1
+                    continue
+
+                if len(frame_peaks) == 0:
+                    for track in active_tracks:
+                        track['frequencies'].append(track['frequencies'][-1])
+                        track['amplitudes'].append(0.0)
+                        track['phases'].append(track['phases'][-1])
+                        track['freq_frame_indices'].append(frame_idx)
+                        track['end_frame'] = frame_idx
+                    continue
+
+                # Hungarian matching
+                n_tracks = len(active_tracks)
+                n_peaks = len(frame_peaks)
+
+                LARGE_COST = 1e10
+                cost_matrix = np.full((n_tracks, n_peaks), LARGE_COST)
+
+                for i, track in enumerate(active_tracks):
+                    freq_pred = track['frequencies'][-1]
+                    for j, peak in enumerate(frame_peaks):
+                        cost_matrix[i, j] = abs(peak['frequency'] - freq_pred)
+
+                track_indices, peak_indices = linear_sum_assignment(cost_matrix)
+
+                matched_peaks = set()
+                matched_tracks = set()
+
+                for track_idx, peak_idx in zip(track_indices, peak_indices):
+                    if cost_matrix[track_idx, peak_idx] < LARGE_COST:
+                        track = active_tracks[track_idx]
+                        peak = frame_peaks[peak_idx]
+
+                        track['frequencies'].append(peak['frequency'])
+                        track['amplitudes'].append(peak['amplitude'])
+                        track['phases'].append(peak['phase'])
+                        track['freq_frame_indices'].append(frame_idx)
+                        track['end_frame'] = frame_idx
+
+                        matched_peaks.add(peak_idx)
+                        matched_tracks.add(track_idx)
+
+                for i, track in enumerate(active_tracks):
+                    if i not in matched_tracks:
+                        track['frequencies'].append(track['frequencies'][-1])
+                        track['amplitudes'].append(0.0)
+                        track['phases'].append(track['phases'][-1])
+                        track['freq_frame_indices'].append(frame_idx)
+                        track['end_frame'] = frame_idx
+
+                for j, peak in enumerate(frame_peaks):
+                    if j not in matched_peaks and len(active_tracks) < self.max_peaks:
+                        new_track = {
+                            'id': global_track_id,
+                            'start_frame': frame_idx,
+                            'end_frame': frame_idx,
+                            'band': band_idx,
+                            'frequencies': [peak['frequency']],
+                            'amplitudes': [peak['amplitude']],
+                            'phases': [peak['phase']],
+                            'freq_frame_indices': [frame_idx]
+                        }
+                        active_tracks.append(new_track)
+                        global_track_id += 1
+
+            all_tracks.extend(active_tracks)
+
+        print(f"   Total tracks: {len(all_tracks)}")
+
+        # Post-process tracks
+        processed_tracks = []
+        for track in all_tracks:
+            # Time calculation uses ORIGINAL sample rate (not band sample rate)
+            freq_times = np.array(track['freq_frame_indices']) * ssq_hop / band_sample_rate
+
+            processed_track = {
+                'id': track['id'],
+                'band': track['band'],
+                'start_frame': track['start_frame'],
+                'end_frame': track['end_frame'],
+                'frequencies': track['frequencies'],
+                'phases': track['phases'],
+                'freq_frame_indices': track['freq_frame_indices'],
+                'freq_times': freq_times.tolist(),
+                'amplitudes': track['amplitudes'],
+                'amp_times': freq_times.tolist(),
+                'hop_size': ssq_hop
+            }
+            processed_tracks.append(processed_track)
+
+        print(f"   ✓ Created {len(processed_tracks)} tracks")
+
+        return processed_tracks
 
     def save_to_hdf5(self, filename, all_channel_tracks, is_stereo, audio_file=None):
         """Save extracted tracks to HDF5 with progress bar"""
