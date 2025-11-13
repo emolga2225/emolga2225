@@ -139,23 +139,43 @@ class HybridResolutionSinusoidalExtractor:
         os.makedirs(band_dir, exist_ok=True)
 
         band_signals = []
+        band_sample_rate = int(bandwidth * 2)  # 12kHz for 6kHz bandwidth
+
+        print(f"   Band sample rate: {band_sample_rate} Hz (2x {bandwidth/1000:.1f} kHz bandwidth)")
 
         for band_idx, (low_freq, high_freq) in enumerate(bands):
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
-            rms = np.sqrt(np.mean(band_signal**2))
+            rms_original = np.sqrt(np.mean(band_signal**2))
 
-            # Export band as WAV at original sample rate
-            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
+            # Step 2: Frequency-shift to baseband and downsample
+            center_freq = (low_freq + high_freq) / 2
+            t = np.arange(len(band_signal)) / self.sample_rate
 
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f} -> {band_filename}")
+            # Complex demodulation - shift to baseband
+            shifted = band_signal * np.exp(-1j * 2 * np.pi * center_freq * t)
 
-            try:
-                sf.write(band_filename, band_signal, self.sample_rate)
-            except Exception as e:
-                print(f"   ERROR writing {band_filename}: {e}")
+            # Downsample to band sample rate
+            g = gcd(int(self.sample_rate), band_sample_rate)
+            up = band_sample_rate // g
+            down = int(self.sample_rate) // g
 
-            band_signals.append((low_freq, high_freq, band_signal))
+            # Take real part and downsample
+            band_baseband = resample_poly(np.real(shifted), up, down)
+
+            rms_baseband = np.sqrt(np.mean(band_baseband**2))
+
+            # Export original band at full sample rate
+            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_orig.wav")
+            sf.write(band_filename, band_signal, self.sample_rate)
+
+            # Export baseband-shifted downsampled band
+            band_baseband_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_baseband.wav")
+            sf.write(band_baseband_filename, band_baseband, band_sample_rate)
+
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms_original:.6f} (orig) / {rms_baseband:.6f} (baseband)")
+
+            band_signals.append((low_freq, high_freq, band_signal, band_baseband, band_sample_rate))
 
         print(f"   ✓ Created {len(band_signals)} bands")
         print(f"   ✓ Exported {len(band_signals)} band WAV files to {band_dir}/")
