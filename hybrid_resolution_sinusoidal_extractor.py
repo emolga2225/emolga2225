@@ -577,4 +577,17 @@ if __name__ == "__main__":
 
     original, all_channel_tracks, is_stereo = extractor.analyze(audio_file)
 
-    print(f"\n✓ Band extraction complete")
+    print(f"\n✓ Band extraction and analysis complete")
+
+    # Save tracks to HDF5
+    hdf5_file = audio_file.replace('.wav', '_tracks.h5')
+    extractor.save_to_hdf5(hdf5_file, all_channel_tracks, is_stereo, audio_file)
+
+    # Synthesize from tracks
+    n_samples = len(original)
+    synthesized = extractor.synthesize_stereo(all_channel_tracks, n_samples, is_stereo)
+
+    # Export synthesized audio
+    output_file = audio_file.replace('.wav', '_synthesized.wav')
+    sf.write(output_file, synthesized, extractor.sample_rate)
+    print(f"\n✓ Exported synthesized audio: {output_file}")
