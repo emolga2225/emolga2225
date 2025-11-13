@@ -649,6 +649,93 @@ class HybridResolutionSinusoidalExtractor:
         print(f"   ✓ Complete")
         return synthesized
 
+    def synthesize_single_track(self, track, n_samples):
+        """Synthesize a single track into audio"""
+        synthesized = np.zeros(n_samples)
+
+        freq_times = np.array(track['freq_times'])
+        frequencies = np.array(track['frequencies'])
+        amp_times = np.array(track['amp_times'])
+        amplitudes = np.array(track['amplitudes'])
+        phases = np.array(track['phases'])
+
+        if len(freq_times) < 1 or len(amplitudes) < 1:
+            return synthesized
+
+        # Use exact birth/death times
+        birth_time = freq_times[0]
+        death_time = freq_times[-1]
+
+        birth_sample = int(birth_time * self.sample_rate)
+        death_sample = int(death_time * self.sample_rate)
+
+        birth_sample = max(0, birth_sample)
+        death_sample = min(n_samples - 1, death_sample)
+
+        if birth_sample >= death_sample:
+            return synthesized
+
+        n_sinusoid_samples = death_sample - birth_sample + 1
+        t = np.arange(n_sinusoid_samples) / self.sample_rate + birth_time
+
+        # Interpolate frequency
+        if len(freq_times) == 1:
+            freq_values = np.full(n_sinusoid_samples, frequencies[0])
+        else:
+            freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+                                bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
+            freq_values = freq_interp(t)
+
+        # Interpolate amplitude
+        if len(amp_times) == 1:
+            amp_values = np.full(n_sinusoid_samples, amplitudes[0])
+        else:
+            amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
+            amp_values = np.maximum(amp_values, 0)
+
+        # Phase integration
+        initial_phase = phases[0]
+        dt = 1.0 / self.sample_rate
+        phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
+
+        # Synthesize
+        sinusoid = amp_values * np.sin(phase)
+
+        # Add to output
+        synthesized[birth_sample:death_sample+1] += sinusoid
+
+        return synthesized
+
+    def export_tracks_as_wav(self, all_channel_tracks, n_samples, output_dir="tracks"):
+        """Export individual sinusoidal tracks as WAV files"""
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"\n🎵 Exporting individual tracks to {output_dir}/")
+
+        total_tracks = sum(len(tracks) for tracks in all_channel_tracks)
+
+        track_counter = 0
+        for ch_idx, tracks in enumerate(all_channel_tracks):
+            for track in tqdm(tracks, desc=f"   Channel {ch_idx}"):
+                # Synthesize single track
+                track_audio = self.synthesize_single_track(track, n_samples)
+
+                # Get track info
+                track_id = track['id']
+                band_idx = track.get('band', 0)
+                start_frame = track['start_frame']
+                end_frame = track['end_frame']
+                mean_freq = np.mean(track['frequencies'])
+
+                # Export WAV
+                filename = os.path.join(output_dir, f"track_{track_id:05d}_ch{ch_idx}_band{band_idx:02d}_{int(mean_freq):05d}Hz.wav")
+                sf.write(filename, track_audio, self.sample_rate)
+
+                track_counter += 1
+
+        print(f"   ✓ Exported {track_counter} track WAV files")
+
 # Usage
 if __name__ == "__main__":
     import os
@@ -671,8 +758,11 @@ if __name__ == "__main__":
     hdf5_file = audio_file.replace('.wav', '_tracks.h5')
     extractor.save_to_hdf5(hdf5_file, all_channel_tracks, is_stereo, audio_file)
 
-    # Synthesize from tracks
+    # Export individual tracks as WAV files
     n_samples = len(original)
+    extractor.export_tracks_as_wav(all_channel_tracks, n_samples, output_dir="tracks")
+
+    # Synthesize from tracks
     synthesized = extractor.synthesize_stereo(all_channel_tracks, n_samples, is_stereo)
 
     # Export synthesized audio
