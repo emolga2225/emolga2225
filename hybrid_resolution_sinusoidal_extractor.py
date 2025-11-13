@@ -174,38 +174,63 @@ class HybridResolutionSinusoidalExtractor:
         band_signals = []
         band_files = []
 
+        # Downsampled sample rate for all bands (2x bandwidth)
+        band_sample_rate = int(bandwidth * 2)
+
         for band_idx, (low_freq, high_freq) in enumerate(bands):
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
 
-            # Export band as WAV at original sample rate
-            # Each band contains frequency content in its specific range
+            # Frequency shift to baseband and downsample
+            # This allows SST processing at lower sample rate for better resolution
+            center_freq = (low_freq + high_freq) / 2
+            t = np.arange(len(band_signal)) / self.sample_rate
+
+            # Complex demodulation to shift to baseband
+            shifted = band_signal * np.exp(-1j * 2 * np.pi * center_freq * t)
+
+            # Downsample to match bandwidth
+            g = gcd(int(self.sample_rate), band_sample_rate)
+            up = band_sample_rate // g
+            down = int(self.sample_rate) // g
+
+            # Downsample real and imaginary separately
+            shifted_real = resample_poly(np.real(shifted), up, down)
+            shifted_imag = resample_poly(np.imag(shifted), up, down)
+
+            # Take real part (baseband signal)
+            band_downsampled = shifted_real  # Real part is the baseband signal
+
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}, SR={band_sample_rate}Hz")
+
+            # Export downsampled band
             band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
-            sf.write(band_filename, band_signal, self.sample_rate)
+            sf.write(band_filename, band_downsampled, band_sample_rate)
 
-            band_signals.append((low_freq, high_freq, band_signal))
+            # Store downsampled version for processing
+            band_signals.append((low_freq, high_freq, band_downsampled, band_sample_rate))
             band_files.append(band_filename)
 
         print(f"   ✓ Exported {len(band_files)} band WAV files to {band_dir}/")
 
-        # Process each band independently with synchrosqueezed STFT
+        # Process each band independently with synchrosqueezed STFT at lower sample rate
         print("   Processing bands with synchrosqueezed STFT...")
 
         all_band_tracks = []
         global_track_id = 0
         ssq_hop = 16
 
-        for band_idx, (low_freq, high_freq, band_signal) in enumerate(tqdm(band_signals, desc="   Analyzing bands")):
+        for band_idx, (low_freq, high_freq, band_signal, band_sr) in enumerate(tqdm(band_signals, desc="   Analyzing bands")):
 
-            # Run synchrosqueezed STFT on this band
+            # Run synchrosqueezed STFT on downsampled band at its sample rate
+            # This gives better time-frequency resolution matched to bandwidth
             Tx, Sx, ssq_freqs, Sfs = ssq_stft(
                 band_signal,
                 window='blackmanharris',
                 n_fft=self.freq_fft_size,
                 hop_len=ssq_hop,
-                fs=self.sample_rate,
+                fs=band_sr,  # Use band sample rate, not original!
                 modulated=True,
                 dtype='float64'
             )
@@ -230,22 +255,27 @@ class HybridResolutionSinusoidalExtractor:
 
                 for idx in peaks_idx[:self.max_peaks]:
                     if ssq_freqs.ndim == 1:
-                        freq = ssq_freqs[idx]
+                        freq_baseband = ssq_freqs[idx]
                     else:
-                        freq = ssq_freqs[idx, 0]
+                        freq_baseband = ssq_freqs[idx, 0]
 
-                    # Filter to band range
-                    if freq < low_freq or freq > high_freq:
+                    # Filter to baseband range (0 to bandwidth)
+                    # Band has been frequency-shifted to baseband
+                    if freq_baseband < -bandwidth/2 or freq_baseband > bandwidth/2:
                         continue
 
-                    if np.isnan(freq) or freq <= 0 or freq >= self.sample_rate / 2:
+                    if np.isnan(freq_baseband) or freq_baseband >= band_sr / 2:
                         continue
+
+                    # Shift frequency back to original band range for storage
+                    center_freq = (low_freq + high_freq) / 2
+                    freq_original = freq_baseband + center_freq
 
                     amp = frame_sx[idx]
                     phase = frame_phase[idx]
 
                     peaks.append({
-                        'frequency': freq,
+                        'frequency': freq_original,  # Store in original frequency range
                         'amplitude': amp,
                         'phase': phase,
                         'bin': idx
@@ -263,6 +293,7 @@ class HybridResolutionSinusoidalExtractor:
                         new_track = {
                             'id': global_track_id,
                             'band': band_idx,
+                            'band_sr': band_sr,  # Store band sample rate
                             'start_frame': frame_idx,
                             'end_frame': frame_idx,
                             'frequencies': [peak['frequency']],
@@ -329,6 +360,7 @@ class HybridResolutionSinusoidalExtractor:
                             'start_frame': frame_idx,
                             'end_frame': frame_idx,
                             'band': band_idx,
+                            'band_sr': band_sr,  # Store band sample rate
                             'frequencies': [peak['frequency']],
                             'amplitudes': [peak['amplitude']],
                             'phases': [peak['phase']],
@@ -344,7 +376,8 @@ class HybridResolutionSinusoidalExtractor:
         # Post-process
         processed_tracks = []
         for track in all_band_tracks:
-            freq_times = np.array(track['freq_frame_indices']) * ssq_hop / self.sample_rate
+            # Use band sample rate for time calculation
+            freq_times = np.array(track['freq_frame_indices']) * ssq_hop / track['band_sr']
 
             processed_track = {
                 'id': track['id'],
@@ -357,7 +390,8 @@ class HybridResolutionSinusoidalExtractor:
                 'freq_times': freq_times.tolist(),
                 'amplitudes': track['amplitudes'],
                 'amp_times': freq_times.tolist(),
-                'hop_size': ssq_hop
+                'hop_size': ssq_hop,
+                'band_sr': track['band_sr']  # Store for synthesis
             }
             processed_tracks.append(processed_track)
 
