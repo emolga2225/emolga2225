@@ -141,6 +141,7 @@ class HybridResolutionSinusoidalExtractor:
 
         # Pre-compute downsampled versions at each edge frequency
         # This ensures phase coherence when we subtract to create bands
+        from math import gcd
         downsampled_versions = {}
 
         for edge_freq in edge_freqs:
@@ -150,11 +151,17 @@ class HybridResolutionSinusoidalExtractor:
                 downsampled_versions[edge_freq] = audio_mono.copy()
             else:
                 target_sample_rate = edge_freq * 2
-                decimation_factor = self.sample_rate / target_sample_rate
-                up = 1
-                down = int(decimation_factor)
 
+                # Compute exact integer ratio using GCD to avoid rounding errors
+                # This ensures precise cutoff frequencies without aliasing
+                g = gcd(int(self.sample_rate), int(target_sample_rate))
+                down = int(self.sample_rate) // g
+                up = int(target_sample_rate) // g
+
+                # Downsample to target rate (lowpass filter)
                 downsampled = resample_poly(audio_mono, up, down)
+
+                # Upsample back to original rate (preserves lowpass filtering)
                 upsampled = resample_poly(downsampled, down, up)
 
                 if len(upsampled) > len(audio_mono):
