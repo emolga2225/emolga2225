@@ -144,11 +144,16 @@ class HybridResolutionSinusoidalExtractor:
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
 
             # Export band as WAV at original sample rate
             band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
-            sf.write(band_filename, band_signal, self.sample_rate)
+
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f} -> {band_filename}")
+
+            try:
+                sf.write(band_filename, band_signal, self.sample_rate)
+            except Exception as e:
+                print(f"   ERROR writing {band_filename}: {e}")
 
             band_signals.append((low_freq, high_freq, band_signal))
 
