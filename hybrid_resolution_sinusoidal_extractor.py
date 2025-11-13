@@ -135,49 +135,41 @@ class HybridResolutionSinusoidalExtractor:
 
         print(f"   Created {len(bands)} overlapping bands (50% overlap, {base_bandwidth/1000:.1f} kHz width)")
 
-        # Create band-limited signals using downsampling methodology
-        # This preserves signal energy better than traditional filters
-        band_signals = []
+        # Collect all unique edge frequencies
+        edge_freqs = sorted(set([low for low, high in bands] + [high for low, high in bands]))
+        print(f"   Pre-computing {len(edge_freqs)} downsampled versions for phase-coherent bands...")
 
-        for low_freq, high_freq in bands:
-            # Lowpass at high_freq using downsampling
-            target_sample_rate = high_freq * 2
+        # Pre-compute downsampled versions at each edge frequency
+        # This ensures phase coherence when we subtract to create bands
+        downsampled_versions = {}
 
-            if target_sample_rate >= self.sample_rate:
-                # No downsampling needed
-                highpass_signal = audio_mono.copy()
+        for edge_freq in edge_freqs:
+            if edge_freq == 0:
+                downsampled_versions[edge_freq] = np.zeros_like(audio_mono)
+            elif edge_freq >= nyquist:
+                downsampled_versions[edge_freq] = audio_mono.copy()
             else:
-                # Downsample and upsample to create ideal lowpass filter
+                target_sample_rate = edge_freq * 2
                 decimation_factor = self.sample_rate / target_sample_rate
                 up = 1
                 down = int(decimation_factor)
 
                 downsampled = resample_poly(audio_mono, up, down)
-                highpass_signal = resample_poly(downsampled, down, up)
+                upsampled = resample_poly(downsampled, down, up)
 
-                if len(highpass_signal) > len(audio_mono):
-                    highpass_signal = highpass_signal[:len(audio_mono)]
-                elif len(highpass_signal) < len(audio_mono):
-                    highpass_signal = np.pad(highpass_signal, (0, len(audio_mono) - len(highpass_signal)))
+                if len(upsampled) > len(audio_mono):
+                    upsampled = upsampled[:len(audio_mono)]
+                elif len(upsampled) < len(audio_mono):
+                    upsampled = np.pad(upsampled, (0, len(audio_mono) - len(upsampled)))
 
-            # Highpass at low_freq by subtracting lower band
-            if low_freq > 0:
-                low_target_sr = low_freq * 2
-                low_decimation = self.sample_rate / low_target_sr
-                low_up = 1
-                low_down = int(low_decimation)
+                downsampled_versions[edge_freq] = upsampled
 
-                low_downsampled = resample_poly(audio_mono, low_up, low_down)
-                lowpass_signal = resample_poly(low_downsampled, low_down, low_up)
+        # Create bands by subtracting pre-computed versions
+        # This preserves phase relationships and avoids cancellation
+        band_signals = []
 
-                if len(lowpass_signal) > len(audio_mono):
-                    lowpass_signal = lowpass_signal[:len(audio_mono)]
-                elif len(lowpass_signal) < len(audio_mono):
-                    lowpass_signal = np.pad(lowpass_signal, (0, len(audio_mono) - len(lowpass_signal)))
-
-                band_signal = highpass_signal - lowpass_signal
-            else:
-                band_signal = highpass_signal
+        for low_freq, high_freq in bands:
+            band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
             print(f"   Band {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz: RMS={rms:.6f}")
