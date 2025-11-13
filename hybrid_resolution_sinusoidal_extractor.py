@@ -174,43 +174,16 @@ class HybridResolutionSinusoidalExtractor:
         band_signals = []
         band_files = []
 
-        # All bands have same bandwidth, so same sample rate (2x bandwidth)
-        band_sample_rate = int(bandwidth * 2)
-
         for band_idx, (low_freq, high_freq) in enumerate(bands):
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
-
-            # Shift band to baseband before downsampling
-            # Band at low_freq-high_freq → shift to 0-bandwidth
-            if band_sample_rate < self.sample_rate:
-                # Frequency shift down by low_freq (move to baseband)
-                t = np.arange(len(band_signal)) / self.sample_rate
-                shift_freq = low_freq + bandwidth / 2  # Shift by center frequency
-
-                # Complex demodulation (shift to baseband)
-                analytic_signal = band_signal * np.exp(-1j * 2 * np.pi * shift_freq * t)
-
-                # Downsample the complex signal
-                g = gcd(int(self.sample_rate), band_sample_rate)
-                up = band_sample_rate // g
-                down = int(self.sample_rate) // g
-
-                # Resample real and imaginary parts
-                real_down = resample_poly(np.real(analytic_signal), up, down)
-                imag_down = resample_poly(np.imag(analytic_signal), up, down)
-
-                # Recombine and take real part (imaginary should be ~0 for baseband)
-                band_downsampled = np.real(real_down + 1j * imag_down)
-            else:
-                band_downsampled = band_signal
-
             print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
 
-            # Export band as WAV at bandwidth-appropriate sample rate
+            # Export band as WAV at original sample rate
+            # Each band contains frequency content in its specific range
             band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
-            sf.write(band_filename, band_downsampled, band_sample_rate)
+            sf.write(band_filename, band_signal, self.sample_rate)
 
             band_signals.append((low_freq, high_freq, band_signal))
             band_files.append(band_filename)
