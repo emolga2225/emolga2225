@@ -117,22 +117,21 @@ class HybridResolutionSinusoidalExtractor:
 
         nyquist = self.sample_rate / 2
 
-        # Overlapping bands with 50% overlap
+        # Overlapping bands with 50% overlap (sliding window style)
         base_bandwidth = 6000  # 6 kHz base bandwidth
         overlap_factor = 0.5    # 50% overlap
         step = base_bandwidth * (1 - overlap_factor)  # 3 kHz step
 
         bands = []
-        center_freq = 0
+        low_freq = 0
 
-        while center_freq < nyquist:
-            low_freq = max(0, center_freq - base_bandwidth / 2)
-            high_freq = min(nyquist, center_freq + base_bandwidth / 2)
+        while low_freq < nyquist:
+            high_freq = min(nyquist, low_freq + base_bandwidth)
 
-            if low_freq < nyquist:
+            if high_freq > low_freq:  # Only add non-empty bands
                 bands.append((low_freq, high_freq))
 
-            center_freq += step
+            low_freq += step
 
         print(f"   Created {len(bands)} overlapping bands (50% overlap, {base_bandwidth/1000:.1f} kHz width)")
 
