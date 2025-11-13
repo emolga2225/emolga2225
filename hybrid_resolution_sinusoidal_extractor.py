@@ -250,7 +250,7 @@ class HybridResolutionSinusoidalExtractor:
             # Extract peaks from each frame
             ssq_peaks = []
 
-            for frame_idx in range(n_time_frames):
+            for frame_idx in tqdm(range(n_time_frames), desc=f"     Band {band_idx} peak detection", leave=False):
                 frame_tx = tx_mag[:, frame_idx]
                 frame_sx = sx_mag[:, frame_idx]
                 frame_phase = sx_phase[:, frame_idx]
@@ -291,7 +291,7 @@ class HybridResolutionSinusoidalExtractor:
             # Track peaks over time using Hungarian algorithm
             active_tracks = []
 
-            for frame_idx, frame_peaks in enumerate(ssq_peaks):
+            for frame_idx, frame_peaks in enumerate(tqdm(ssq_peaks, desc=f"     Band {band_idx} tracking", leave=False)):
                 if len(active_tracks) == 0:
                     for peak in frame_peaks[:self.max_peaks]:
                         new_track = {
