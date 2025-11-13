@@ -6,6 +6,13 @@ from scipy.interpolate import interp1d
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
+# GPU acceleration
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 class HybridResolutionSinusoidalExtractor:
 
     def __init__(self, sample_rate=192000):
@@ -20,7 +27,17 @@ class HybridResolutionSinusoidalExtractor:
         # Tracking parameters
         self.max_peaks = 9999999
 
-        print("Hybrid Resolution Sinusoidal Extractor")
+        # GPU acceleration
+        self.use_gpu = False
+        self.device = 'cpu'
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            self.use_gpu = True
+            self.device = torch.device('cuda')
+            print("Hybrid Resolution Sinusoidal Extractor [GPU Mode]")
+            print(f"   GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print("Hybrid Resolution Sinusoidal Extractor [CPU Mode]")
+
         print(f"   Sample rate: {sample_rate} Hz")
         print(f"   Frequency tracking: FFT={self.freq_fft_size}, Hop={self.freq_hop_size}")
 
@@ -317,19 +334,35 @@ class HybridResolutionSinusoidalExtractor:
                         track['end_frame'] = frame_idx
                     continue
 
-                # Hungarian matching
+                # Hungarian matching with GPU acceleration
                 n_tracks = len(active_tracks)
                 n_peaks = len(frame_peaks)
 
                 LARGE_COST = 1e10
-                cost_matrix = np.full((n_tracks, n_peaks), LARGE_COST)
 
-                for i, track in enumerate(active_tracks):
-                    freq_pred = track['frequencies'][-1]
-                    for j, peak in enumerate(frame_peaks):
-                        cost_matrix[i, j] = abs(peak['frequency'] - freq_pred)
+                if self.use_gpu:
+                    # GPU-accelerated cost matrix computation
+                    freq_pred = torch.tensor([track['frequencies'][-1] for track in active_tracks],
+                                            dtype=torch.float32, device=self.device)
+                    peak_freqs = torch.tensor([peak['frequency'] for peak in frame_peaks],
+                                             dtype=torch.float32, device=self.device)
 
-                track_indices, peak_indices = linear_sum_assignment(cost_matrix)
+                    # Compute cost matrix using broadcasting
+                    cost_matrix = torch.abs(peak_freqs[None, :] - freq_pred[:, None])
+
+                    # Convert to CPU for scipy linear_sum_assignment
+                    cost_matrix_cpu = cost_matrix.cpu().numpy()
+                    track_indices, peak_indices = linear_sum_assignment(cost_matrix_cpu)
+                    cost_matrix = cost_matrix_cpu
+                else:
+                    # CPU path
+                    cost_matrix = np.full((n_tracks, n_peaks), LARGE_COST)
+                    for i, track in enumerate(active_tracks):
+                        freq_pred = track['frequencies'][-1]
+                        for j, peak in enumerate(frame_peaks):
+                            cost_matrix[i, j] = abs(peak['frequency'] - freq_pred)
+
+                    track_indices, peak_indices = linear_sum_assignment(cost_matrix)
 
                 matched_peaks = set()
                 matched_tracks = set()
