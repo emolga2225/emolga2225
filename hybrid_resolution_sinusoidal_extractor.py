@@ -742,6 +742,10 @@ if __name__ == "__main__":
 
     audio_file = "Oooo_1sec_left.wav"
 
+    # Options
+    export_individual_tracks = False  # Set to True to export each track as separate WAV
+    export_combined = True            # Set to True to export combined synthesis
+
     # Read sample rate from file
     print(f"📂 Reading: {audio_file}")
     _, sr_detected = sf.read(audio_file, frames=1)
@@ -758,14 +762,15 @@ if __name__ == "__main__":
     hdf5_file = audio_file.replace('.wav', '_tracks.h5')
     extractor.save_to_hdf5(hdf5_file, all_channel_tracks, is_stereo, audio_file)
 
-    # Export individual tracks as WAV files
     n_samples = len(original)
-    extractor.export_tracks_as_wav(all_channel_tracks, n_samples, output_dir="tracks")
 
-    # Synthesize from tracks
-    synthesized = extractor.synthesize_stereo(all_channel_tracks, n_samples, is_stereo)
+    # Export individual tracks as WAV files (optional)
+    if export_individual_tracks:
+        extractor.export_tracks_as_wav(all_channel_tracks, n_samples, output_dir="tracks")
 
-    # Export synthesized audio
-    output_file = audio_file.replace('.wav', '_synthesized.wav')
-    sf.write(output_file, synthesized, extractor.sample_rate)
-    print(f"\n✓ Exported synthesized audio: {output_file}")
+    # Synthesize and export combined audio (optional)
+    if export_combined:
+        synthesized = extractor.synthesize_stereo(all_channel_tracks, n_samples, is_stereo)
+        output_file = audio_file.replace('.wav', '_synthesized.wav')
+        sf.write(output_file, synthesized, extractor.sample_rate)
+        print(f"\n✓ Exported synthesized audio: {output_file}")
