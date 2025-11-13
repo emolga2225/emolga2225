@@ -174,16 +174,16 @@ class HybridResolutionSinusoidalExtractor:
         band_signals = []
         band_files = []
 
+        # All bands have same bandwidth, so same sample rate (2x bandwidth)
+        band_sample_rate = int(bandwidth * 2)
+
         for band_idx, (low_freq, high_freq) in enumerate(bands):
             band_signal = downsampled_versions[high_freq] - downsampled_versions[low_freq]
 
             rms = np.sqrt(np.mean(band_signal**2))
 
-            # Downsample band to appropriate sample rate (2x highest frequency)
-            band_sample_rate = int(high_freq * 2)
-
+            # Downsample to match bandwidth (same for all bands)
             if band_sample_rate < self.sample_rate:
-                # Downsample to match band content
                 g = gcd(int(self.sample_rate), band_sample_rate)
                 up = band_sample_rate // g
                 down = int(self.sample_rate) // g
@@ -191,12 +191,11 @@ class HybridResolutionSinusoidalExtractor:
                 band_downsampled = resample_poly(band_signal, up, down)
             else:
                 band_downsampled = band_signal
-                band_sample_rate = self.sample_rate
 
-            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}, SR={band_sample_rate}Hz")
+            print(f"   Band {band_idx}: {low_freq/1000:.1f}-{high_freq/1000:.1f} kHz, RMS={rms:.6f}")
 
-            # Export band as WAV at appropriate sample rate
-            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz_{band_sample_rate}Hz.wav")
+            # Export band as WAV at bandwidth-appropriate sample rate
+            band_filename = os.path.join(band_dir, f"band_{band_idx:02d}_{int(low_freq/1000):02d}-{int(high_freq/1000):02d}kHz.wav")
             sf.write(band_filename, band_downsampled, band_sample_rate)
 
             band_signals.append((low_freq, high_freq, band_signal))
