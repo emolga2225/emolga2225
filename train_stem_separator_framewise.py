@@ -122,10 +122,10 @@ class FramewiseSinusoidalDataset(Dataset):
         labels[labels == -1] = self.n_stems  # Unknown class
 
         return {
-            'features': torch.from_numpy(features),
-            'mask': torch.from_numpy(mask),
+            'features': torch.from_numpy(features.copy()),
+            'mask': torch.from_numpy(mask.copy()),
             'band': torch.tensor([band], dtype=torch.long),
-            'labels': torch.from_numpy(labels)  # [window_size] frame-level labels
+            'labels': torch.from_numpy(labels.copy())  # [window_size] frame-level labels
         }
 
 
