@@ -80,8 +80,8 @@ class FramewiseStemClassifier(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(4, d_model)  # [freq, log_amp, cos_phase, sin_phase]
 
-        # Band embedding (16 bands)
-        self.band_embedding = nn.Embedding(16, d_model)
+        # Band embedding (32 bands)
+        self.band_embedding = nn.Embedding(32, d_model)
 
         # Positional encoding
         self.pos_encoding = nn.Parameter(torch.randn(1, window_size, d_model))
