@@ -111,7 +111,8 @@ class FramewiseStemMatcher:
 
         Args:
             mix_h5: Path to mix HDF5 file
-            stem_h5_files: List of paths to stem HDF5 files
+            stem_h5_files: List of (stem files or list of files) for each stem
+                          e.g., ['vocals.h5', 'guitar.h5', ['drums_1.h5', 'drums_2.h5']]
             stem_names: List of stem names
             channel: Channel index to process
 
@@ -124,11 +125,21 @@ class FramewiseStemMatcher:
 
         # Load all stem tracks
         stem_tracks_list = []
-        for stem_idx, (stem_file, stem_name) in enumerate(zip(stem_h5_files, stem_names)):
-            print(f"Loading {stem_name} tracks from {stem_file}...")
-            stem_tracks = self.load_tracks_with_frames(stem_file, channel)
-            print(f"  Found {len(stem_tracks)} {stem_name} tracks")
-            stem_tracks_list.append((stem_tracks, stem_idx))
+        for stem_idx, (stem_files, stem_name) in enumerate(zip(stem_h5_files, stem_names)):
+            # Handle both single file and list of files
+            if isinstance(stem_files, str):
+                stem_files = [stem_files]
+
+            # Load and combine tracks from all files for this stem
+            combined_stem_tracks = []
+            for stem_file in stem_files:
+                print(f"Loading {stem_name} tracks from {stem_file}...")
+                stem_tracks = self.load_tracks_with_frames(stem_file, channel)
+                print(f"  Found {len(stem_tracks)} tracks")
+                combined_stem_tracks.extend(stem_tracks)
+
+            print(f"  Total {stem_name} tracks: {len(combined_stem_tracks)}")
+            stem_tracks_list.append((combined_stem_tracks, stem_idx))
 
         # Match each frame of each mix track
         print("\nMatching frames to stems...")
@@ -190,7 +201,8 @@ def main():
         "vocals_tracks.h5",
         "guitar_tracks.h5",
         "bass_tracks.h5",
-        "drums_1_tracks.h5"  # You might want to merge all drum tracks
+        # Drums: combine all 4 drum tracks into single "drums" stem
+        ["drums_1_tracks.h5", "drums_2_tracks.h5", "drums_3_tracks.h5", "drums_4_tracks.h5"]
     ]
     stem_names = ["vocals", "guitar", "bass", "drums"]
 
