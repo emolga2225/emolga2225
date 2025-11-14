@@ -284,7 +284,7 @@ def main():
         dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=4,
+        num_workers=0,  # Disable multiprocessing for HDF5 compatibility
         pin_memory=True if config['device'] == 'cuda' else False
     )
 
