@@ -48,13 +48,15 @@ def preprocess_dataset(
     total_windows = 0
     window_info_list = []
 
-    for track_idx_str, labels_list in tqdm(labels_data.items(), desc="Counting"):
+    for track_idx_str, track_data in tqdm(labels_data.items(), desc="Counting"):
         track_idx = int(track_idx_str)
         track_key = f'track_{track_idx}'
 
         if track_key not in mix_file:
             continue
 
+        labels_list = track_data['labels']
+        band = track_data['band']
         track_len = len(labels_list)
 
         # Skip tracks shorter than window size
@@ -79,7 +81,8 @@ def preprocess_dataset(
                 'track_idx': track_idx,
                 'start_frame': start_frame,
                 'end_frame': end_frame,
-                'labels': window_labels
+                'labels': window_labels,
+                'band': band
             })
             total_windows += 1
 
@@ -122,7 +125,7 @@ def preprocess_dataset(
 
         # Read track data
         grp = mix_file[track_key]
-        band = grp.attrs['band']
+        band = window_info['band']
 
         # Get track lengths for offset calculation
         track_lens = grp['track_lens'][:]
