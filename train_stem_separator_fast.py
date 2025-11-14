@@ -199,7 +199,7 @@ def main():
         'nhead': 8,
         'num_layers': 4,
         'window_size': 32,
-        'learning_rate': 1e-3,
+        'learning_rate': 5e-3,
         'n_epochs': 100,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'checkpoint_dir': 'checkpoints',
