@@ -68,6 +68,10 @@ def resume_training(checkpoint_path, additional_epochs=20, new_lr=None, use_clas
         # Normalize weights
         class_weights_np = class_weights_np / class_weights_np.sum() * 6
 
+        # Cap unknown class weight to avoid instability (index 5)
+        # Unknown frames are likely mismatches/noise, not a real class
+        class_weights_np[5] = 1.0  # Set unknown to baseline weight
+
         class_weights = torch.FloatTensor(class_weights_np).to(config['device'])
 
         print("\nClass distribution and weights:")
