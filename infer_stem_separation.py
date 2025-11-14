@@ -51,19 +51,19 @@ def load_model(checkpoint_path, device='cuda'):
 
 def classify_tracks(model, tracks_h5_path, config, device='cuda'):
     """
-    Classify all tracks in an HDF5 file.
+    Classify all tracks in an HDF5 file using sliding windows.
+
+    With immortal tracks, each track can contain multiple stems at different
+    times, so we classify frame-by-frame using sliding windows.
 
     Returns:
-        track_predictions: dict mapping track_idx -> {
-            'stem': predicted stem (0-4),
-            'confidence': confidence score,
-            'band': frequency band
-        }
+        frame_predictions: dict mapping track_idx -> list of frame-level predictions
     """
     print(f"\nClassifying tracks from {tracks_h5_path}...")
 
     window_size = config['window_size']
-    track_predictions = {}
+    window_stride = window_size // 2  # 50% overlap
+    frame_predictions = {}  # track_id -> list of (frame_idx, stem, confidence)
 
     with h5py.File(tracks_h5_path, 'r') as f:
         # Handle both compact (c0, c1) and individual track formats
@@ -118,66 +118,66 @@ def classify_tracks(model, tracks_h5_path, config, device='cuda'):
 
         print(f"Found {len(all_tracks)} tracks")
 
-        # Classify tracks in batches for speed
-        batch_size = 64
+        # Create all windows from all tracks
+        all_windows = []
+        for track in all_tracks:
+            track_id = track['id']
+            band = track['band']
+            freqs = track['freqs']
+            amps = track['amps']
+            phases = track['phases']
+            n_frames = len(freqs)
+
+            # Skip very short tracks
+            if n_frames < window_size:
+                frame_predictions[track_id] = []
+                continue
+
+            # Create sliding windows
+            for start_frame in range(0, n_frames - window_size + 1, window_stride):
+                end_frame = start_frame + window_size
+
+                window_freqs = freqs[start_frame:end_frame]
+                window_amps = amps[start_frame:end_frame]
+                window_phases = phases[start_frame:end_frame]
+
+                all_windows.append({
+                    'track_id': track_id,
+                    'band': band,
+                    'start_frame': start_frame,
+                    'end_frame': end_frame,
+                    'freqs': window_freqs,
+                    'amps': window_amps,
+                    'phases': window_phases
+                })
+
+        print(f"Created {len(all_windows):,} windows from {len(all_tracks)} tracks")
+
+        # Classify windows in batches
+        batch_size = 256
         with torch.no_grad():
-            for batch_start in tqdm(range(0, len(all_tracks), batch_size), desc="Classifying"):
-                batch_tracks = all_tracks[batch_start:batch_start + batch_size]
+            for batch_start in tqdm(range(0, len(all_windows), batch_size), desc="Classifying"):
+                batch_windows = all_windows[batch_start:batch_start + batch_size]
 
                 batch_features = []
                 batch_masks = []
                 batch_bands = []
-                batch_track_info = []
 
-                for track in batch_tracks:
-                    track_id = track['id']
-                    band = track['band']
-                    freqs = track['freqs']
-                    amps = track['amps']
-                    phases = track['phases']
-
-                    n_frames = len(freqs)
-
-                    # Skip very short tracks
-                    if n_frames < window_size:
-                        track_predictions[track_id] = {
-                            'stem': 5,  # Unknown
-                            'confidence': 0.0,
-                            'band': band
-                        }
-                        continue
-
-                    # Use middle window only for speed (instead of sliding windows)
-                    mid_frame = n_frames // 2
-                    start_frame = max(0, mid_frame - window_size // 2)
-                    end_frame = start_frame + window_size
-
-                    if end_frame > n_frames:
-                        end_frame = n_frames
-                        start_frame = max(0, end_frame - window_size)
-
-                    window_freqs = freqs[start_frame:end_frame]
-                    window_amps = amps[start_frame:end_frame]
-                    window_phases = phases[start_frame:end_frame]
-
+                for window in batch_windows:
                     # Create features
                     features = np.zeros((window_size, 4), dtype=np.float32)
-                    actual_len = len(window_freqs)
-                    features[:actual_len, 0] = window_freqs / 96000.0  # Normalized frequency
-                    features[:actual_len, 1] = np.log1p(window_amps)    # Log amplitude
-                    features[:actual_len, 2] = np.cos(window_phases)    # Phase cos
-                    features[:actual_len, 3] = np.sin(window_phases)    # Phase sin
+                    actual_len = len(window['freqs'])
+                    features[:actual_len, 0] = window['freqs'] / 96000.0
+                    features[:actual_len, 1] = np.log1p(window['amps'])
+                    features[:actual_len, 2] = np.cos(window['phases'])
+                    features[:actual_len, 3] = np.sin(window['phases'])
 
                     mask = np.zeros(window_size, dtype=np.float32)
                     mask[:actual_len] = 1.0
 
                     batch_features.append(features)
                     batch_masks.append(mask)
-                    batch_bands.append(band)
-                    batch_track_info.append({'id': track_id, 'band': band})
-
-                if len(batch_features) == 0:
-                    continue
+                    batch_bands.append(window['band'])
 
                 # Batch inference
                 features_tensor = torch.from_numpy(np.array(batch_features)).to(device)
@@ -188,33 +188,40 @@ def classify_tracks(model, tracks_h5_path, config, device='cuda'):
                 logits = model(features_tensor, masks_tensor, bands_tensor)
                 probs = torch.softmax(logits, dim=-1)  # [batch, window_size, n_stems]
 
-                # Average across frames for each track
-                for i, track_info in enumerate(batch_track_info):
-                    track_id = track_info['id']
-                    band = track_info['band']
+                # Store frame-level predictions
+                for i, window in enumerate(batch_windows):
+                    track_id = window['track_id']
+                    start_frame = window['start_frame']
 
-                    # Average probabilities across valid frames
-                    track_probs = probs[i].cpu().numpy()  # [window_size, n_stems]
-                    mask = batch_masks[i]
+                    if track_id not in frame_predictions:
+                        frame_predictions[track_id] = {}
 
-                    # Weighted average by mask
-                    stem_probs = (track_probs * mask[:, None]).sum(axis=0) / mask.sum()
+                    # Get predictions for each frame in window
+                    window_probs = probs[i].cpu().numpy()  # [window_size, n_stems]
 
-                    predicted_stem = int(stem_probs.argmax())
-                    confidence = float(stem_probs[predicted_stem])
+                    for frame_offset in range(window_size):
+                        frame_idx = start_frame + frame_offset
+                        predicted_stem = int(window_probs[frame_offset].argmax())
+                        confidence = float(window_probs[frame_offset, predicted_stem])
 
-                    track_predictions[track_id] = {
-                        'stem': predicted_stem,
-                        'confidence': confidence,
-                        'band': band
-                    }
+                        # Average predictions if frame appears in multiple windows
+                        if frame_idx in frame_predictions[track_id]:
+                            # Average with existing prediction
+                            old_stem, old_conf, count = frame_predictions[track_id][frame_idx]
+                            new_count = count + 1
+                            frame_predictions[track_id][frame_idx] = (predicted_stem, confidence, new_count)
+                        else:
+                            frame_predictions[track_id][frame_idx] = (predicted_stem, confidence, 1)
 
-    return track_predictions
+    return frame_predictions
 
 
-def load_and_reconstruct_tracks(h5_file, track_ids):
+def load_and_reconstruct_track_segments(h5_file, segments):
     """
-    Load tracks from HDF5 and reconstruct them for synthesis.
+    Load track segments from HDF5 and reconstruct them for synthesis.
+
+    Args:
+        segments: list of (track_id, start_frame, end_frame) tuples
 
     Returns list of track dicts with freq_times, amp_times, etc.
     """
@@ -240,8 +247,8 @@ def load_and_reconstruct_tracks(h5_file, track_ids):
         for local_idx, tid in enumerate(track_ids_in_group):
             track_data_map[int(tid)] = (group_name, local_idx)
 
-    # Load requested tracks
-    for track_id in track_ids:
+    # Load requested track segments
+    for track_id, start_frame, end_frame in segments:
         if track_id not in track_data_map:
             continue
 
@@ -252,15 +259,21 @@ def load_and_reconstruct_tracks(h5_file, track_ids):
         track_lens = grp['len'][:]
         track_hops = grp['h'][:]
 
-        # Calculate offset
+        # Calculate offset for this track
         offset = sum(track_lens[:local_idx])
         n = int(track_lens[local_idx])
 
-        # Extract track data
-        frequencies = grp['f'][offset:offset+n].tolist()
-        phases = grp['p'][offset:offset+n].tolist()
-        amplitudes = grp['a'][offset:offset+n].tolist()
-        indices = grp['i'][offset:offset+n].tolist()
+        # Extract only the specified segment
+        seg_start = max(0, start_frame)
+        seg_end = min(n - 1, end_frame)
+
+        if seg_start >= seg_end:
+            continue
+
+        frequencies = grp['f'][offset + seg_start:offset + seg_end + 1].tolist()
+        phases = grp['p'][offset + seg_start:offset + seg_end + 1].tolist()
+        amplitudes = grp['a'][offset + seg_start:offset + seg_end + 1].tolist()
+        indices = grp['i'][offset + seg_start:offset + seg_end + 1].tolist()
 
         # Reconstruct times from indices and hop size
         hop_size = int(track_hops[local_idx])
@@ -344,11 +357,12 @@ def synthesize_tracks_gpu(tracks, n_samples, sample_rate, device='cuda'):
     return synthesized.cpu().numpy()
 
 
-def synthesize_stems(tracks_h5_path, track_predictions, output_dir, use_gpu=True):
+def synthesize_stems(tracks_h5_path, frame_predictions, output_dir, use_gpu=True):
     """
-    Synthesize separate audio files for each stem.
+    Synthesize separate audio files for each stem using frame-level predictions.
 
-    Groups tracks by predicted stem and synthesizes audio.
+    For immortal tracks, segments of tracks are assigned to different stems
+    based on frame-level classifications.
     """
     import soundfile as sf
 
@@ -359,17 +373,46 @@ def synthesize_stems(tracks_h5_path, track_predictions, output_dir, use_gpu=True
     device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # Group tracks by stem
-    stem_tracks = {i: [] for i in range(6)}  # 0-4: stems, 5: unknown
+    # Group track segments by stem
+    # stem_segments[stem_idx] = [(track_id, start_frame, end_frame), ...]
+    stem_segments = {i: [] for i in range(6)}  # 0-4: stems, 5: unknown
 
-    for track_id, pred in track_predictions.items():
-        stem_tracks[pred['stem']].append(track_id)
+    # Process each track's frame predictions
+    for track_id, frame_preds in frame_predictions.items():
+        if len(frame_preds) == 0:
+            continue
+
+        # Convert to sorted list of (frame_idx, stem, confidence)
+        frames = sorted([(idx, pred[0], pred[1]) for idx, pred in frame_preds.items()])
+
+        # Group consecutive frames with same stem
+        if len(frames) == 0:
+            continue
+
+        current_stem = frames[0][1]
+        segment_start = frames[0][0]
+        segment_end = frames[0][0]
+
+        for frame_idx, stem, conf in frames[1:]:
+            if stem == current_stem and frame_idx == segment_end + 1:
+                # Continue current segment
+                segment_end = frame_idx
+            else:
+                # Save current segment and start new one
+                stem_segments[current_stem].append((track_id, segment_start, segment_end))
+                current_stem = stem
+                segment_start = frame_idx
+                segment_end = frame_idx
+
+        # Save final segment
+        stem_segments[current_stem].append((track_id, segment_start, segment_end))
 
     # Print statistics
     print("\nPrediction statistics:")
-    for stem_idx, track_ids in stem_tracks.items():
+    for stem_idx, segments in stem_segments.items():
         stem_name = STEM_NAMES[stem_idx] if stem_idx < 5 else 'unknown'
-        print(f"  {stem_name}: {len(track_ids)} tracks")
+        unique_tracks = len(set(seg[0] for seg in segments))
+        print(f"  {stem_name}: {len(segments)} segments from {unique_tracks} tracks")
 
     # Synthesize each stem
     with h5py.File(tracks_h5_path, 'r') as f:
@@ -395,18 +438,19 @@ def synthesize_stems(tracks_h5_path, track_predictions, output_dir, use_gpu=True
         n_samples = int(max_end_time * sample_rate) + sample_rate  # Add 1 second buffer
         print(f"\nAudio length: {n_samples / sample_rate:.2f} seconds ({sample_rate} Hz)")
 
-        for stem_idx, track_ids in stem_tracks.items():
-            if len(track_ids) == 0:
+        for stem_idx, segments in stem_segments.items():
+            if len(segments) == 0:
                 continue
 
             stem_name = STEM_NAMES[stem_idx] if stem_idx < 5 else 'unknown'
-            print(f"\n  {stem_name}: {len(track_ids)} tracks")
+            unique_tracks = len(set(seg[0] for seg in segments))
+            print(f"\n  {stem_name}: {len(segments)} segments from {unique_tracks} tracks")
 
-            # Load and reconstruct tracks
-            tracks, sr = load_and_reconstruct_tracks(f, track_ids)
+            # Load and reconstruct track segments
+            tracks, sr = load_and_reconstruct_track_segments(f, segments)
 
             if len(tracks) == 0:
-                print(f"    No tracks to synthesize")
+                print(f"    No segments to synthesize")
                 continue
 
             # Synthesize
@@ -445,30 +489,34 @@ def main():
     # Load model
     model, config = load_model(args.checkpoint, device=args.device)
 
-    # Classify tracks
-    track_predictions = classify_tracks(model, args.input_h5, config, device=args.device)
+    # Classify tracks (frame-level with immortal tracks support)
+    frame_predictions = classify_tracks(model, args.input_h5, config, device=args.device)
 
     # Save predictions
-    predictions_path = Path(args.output_dir) / 'track_predictions.json'
+    predictions_path = Path(args.output_dir) / 'frame_predictions.json'
     predictions_path.parent.mkdir(exist_ok=True, parents=True)
 
-    predictions_serializable = {
-        str(track_id): {
-            'stem': pred['stem'],
-            'stem_name': STEM_NAMES[pred['stem']] if pred['stem'] < 5 else 'unknown',
-            'confidence': pred['confidence'],
-            'band': pred['band']
+    predictions_serializable = {}
+    for track_id, frame_preds in frame_predictions.items():
+        predictions_serializable[str(track_id)] = {
+            'frames': {
+                str(frame_idx): {
+                    'stem': int(pred[0]),
+                    'stem_name': STEM_NAMES[pred[0]] if pred[0] < 5 else 'unknown',
+                    'confidence': float(pred[1]),
+                    'count': int(pred[2])  # How many overlapping windows predicted this frame
+                }
+                for frame_idx, pred in frame_preds.items()
+            }
         }
-        for track_id, pred in track_predictions.items()
-    }
 
     with open(predictions_path, 'w') as f:
         json.dump(predictions_serializable, f, indent=2)
 
-    print(f"\nSaved predictions to {predictions_path}")
+    print(f"\nSaved frame-level predictions to {predictions_path}")
 
     # Synthesize stems
-    synthesize_stems(args.input_h5, track_predictions, args.output_dir)
+    synthesize_stems(args.input_h5, frame_predictions, args.output_dir)
 
 
 if __name__ == '__main__':
