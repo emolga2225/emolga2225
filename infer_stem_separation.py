@@ -118,65 +118,96 @@ def classify_tracks(model, tracks_h5_path, config, device='cuda'):
 
         print(f"Found {len(all_tracks)} tracks")
 
-        # Classify each track
+        # Classify tracks in batches for speed
+        batch_size = 64
         with torch.no_grad():
-            for track in tqdm(all_tracks, desc="Classifying"):
-                track_id = track['id']
-                band = track['band']
-                freqs = track['freqs']
-                amps = track['amps']
-                phases = track['phases']
+            for batch_start in tqdm(range(0, len(all_tracks), batch_size), desc="Classifying"):
+                batch_tracks = all_tracks[batch_start:batch_start + batch_size]
 
-                n_frames = len(freqs)
+                batch_features = []
+                batch_masks = []
+                batch_bands = []
+                batch_track_info = []
 
-                # Skip very short tracks
-                if n_frames < window_size:
-                    track_predictions[track_id] = {
-                        'stem': 5,  # Unknown
-                        'confidence': 0.0,
-                        'band': band
-                    }
+                for track in batch_tracks:
+                    track_id = track['id']
+                    band = track['band']
+                    freqs = track['freqs']
+                    amps = track['amps']
+                    phases = track['phases']
+
+                    n_frames = len(freqs)
+
+                    # Skip very short tracks
+                    if n_frames < window_size:
+                        track_predictions[track_id] = {
+                            'stem': 5,  # Unknown
+                            'confidence': 0.0,
+                            'band': band
+                        }
+                        continue
+
+                    # Use middle window only for speed (instead of sliding windows)
+                    mid_frame = n_frames // 2
+                    start_frame = max(0, mid_frame - window_size // 2)
+                    end_frame = start_frame + window_size
+
+                    if end_frame > n_frames:
+                        end_frame = n_frames
+                        start_frame = max(0, end_frame - window_size)
+
+                    window_freqs = freqs[start_frame:end_frame]
+                    window_amps = amps[start_frame:end_frame]
+                    window_phases = phases[start_frame:end_frame]
+
+                    # Create features
+                    features = np.zeros((window_size, 4), dtype=np.float32)
+                    actual_len = len(window_freqs)
+                    features[:actual_len, 0] = window_freqs / 96000.0  # Normalized frequency
+                    features[:actual_len, 1] = np.log1p(window_amps)    # Log amplitude
+                    features[:actual_len, 2] = np.cos(window_phases)    # Phase cos
+                    features[:actual_len, 3] = np.sin(window_phases)    # Phase sin
+
+                    mask = np.zeros(window_size, dtype=np.float32)
+                    mask[:actual_len] = 1.0
+
+                    batch_features.append(features)
+                    batch_masks.append(mask)
+                    batch_bands.append(band)
+                    batch_track_info.append({'id': track_id, 'band': band})
+
+                if len(batch_features) == 0:
                     continue
 
-                # Create features for all frames
-                features = np.zeros((n_frames, 4), dtype=np.float32)
-                features[:, 0] = freqs / 96000.0  # Normalized frequency
-                features[:, 1] = np.log1p(amps)    # Log amplitude
-                features[:, 2] = np.cos(phases)    # Phase cos
-                features[:, 3] = np.sin(phases)    # Phase sin
+                # Batch inference
+                features_tensor = torch.from_numpy(np.array(batch_features)).to(device)
+                masks_tensor = torch.from_numpy(np.array(batch_masks)).to(device)
+                bands_tensor = torch.tensor([[b] for b in batch_bands], dtype=torch.long).to(device)
 
-                # Classify using sliding windows
-                stem_votes = np.zeros(6)  # 5 stems + unknown
-                total_windows = 0
+                # Classify batch
+                logits = model(features_tensor, masks_tensor, bands_tensor)
+                probs = torch.softmax(logits, dim=-1)  # [batch, window_size, n_stems]
 
-                for start_frame in range(0, n_frames - window_size + 1, window_size // 2):
-                    end_frame = start_frame + window_size
-                    window_features = features[start_frame:end_frame]
+                # Average across frames for each track
+                for i, track_info in enumerate(batch_track_info):
+                    track_id = track_info['id']
+                    band = track_info['band']
 
-                    # Prepare batch
-                    window_tensor = torch.from_numpy(window_features).unsqueeze(0).to(device)
-                    mask_tensor = torch.ones(1, window_size).to(device)
-                    band_tensor = torch.tensor([[band]], dtype=torch.long).to(device)
+                    # Average probabilities across valid frames
+                    track_probs = probs[i].cpu().numpy()  # [window_size, n_stems]
+                    mask = batch_masks[i]
 
-                    # Classify
-                    logits = model(window_tensor, mask_tensor, band_tensor)
-                    probs = torch.softmax(logits, dim=-1)
+                    # Weighted average by mask
+                    stem_probs = (track_probs * mask[:, None]).sum(axis=0) / mask.sum()
 
-                    # Vote across frames in window
-                    window_probs = probs[0].cpu().numpy()  # [window_size, n_stems]
-                    stem_votes += window_probs.sum(axis=0)
-                    total_windows += window_size
+                    predicted_stem = int(stem_probs.argmax())
+                    confidence = float(stem_probs[predicted_stem])
 
-                # Get final prediction
-                stem_probs = stem_votes / total_windows
-                predicted_stem = int(stem_probs.argmax())
-                confidence = float(stem_probs[predicted_stem])
-
-                track_predictions[track_id] = {
-                    'stem': predicted_stem,
-                    'confidence': confidence,
-                    'band': band
-                }
+                    track_predictions[track_id] = {
+                        'stem': predicted_stem,
+                        'confidence': confidence,
+                        'band': band
+                    }
 
     return track_predictions
 
