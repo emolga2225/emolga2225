@@ -228,15 +228,16 @@ class FastFramewiseStemMatcher:
 def main():
     """Example usage"""
     # Configuration
-    mix_h5 = "fullmix_tracks.h5"
+    mix_h5 = "fullmix_tracks.h5"  # Complete mix
     stem_h5_files = [
         "vocals_tracks.h5",
         "guitar_tracks.h5",
         "bass_tracks.h5",
+        "song_tracks.h5",  # Everything else (keyboards, rhythm guitar, etc.)
         # Drums: combine all 4 drum tracks into single "drums" stem
         ["drums_1_tracks.h5", "drums_2_tracks.h5", "drums_3_tracks.h5", "drums_4_tracks.h5"]
     ]
-    stem_names = ["vocals", "guitar", "bass", "drums"]
+    stem_names = ["vocals", "guitar", "bass", "other", "drums"]
 
     print("Fast Frame-wise Stem Matcher")
     print("=" * 60)
