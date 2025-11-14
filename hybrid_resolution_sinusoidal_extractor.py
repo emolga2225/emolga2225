@@ -626,7 +626,7 @@ class HybridResolutionSinusoidalExtractor:
                 if len(freq_times) == 1:
                     freq_values = np.full(n_sinusoid_samples, frequencies[0])
                 else:
-                    freq_interp = interp1d(freq_times, frequencies, kind='linear',
+                    freq_interp = interp1d(freq_times, frequencies, kind='nearest',
                                         bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
                     freq_values = freq_interp(t)
 
@@ -641,20 +641,13 @@ class HybridResolutionSinusoidalExtractor:
                 freq_values_gpu = torch.from_numpy(freq_values).float().to(self.device)
                 amp_values_gpu = torch.from_numpy(amp_values).float().to(self.device)
 
-                # Interpolate phase directly (preserves phase coherence)
-                if len(freq_times) == 1:
-                    phase_values = np.full(n_sinusoid_samples, phases[0])
-                else:
-                    # Unwrap phases to handle 2π discontinuities
-                    phases_unwrapped = np.unwrap(phases)
-                    phase_interp = interp1d(freq_times, phases_unwrapped, kind='linear',
-                                          bounds_error=False, fill_value=(phases_unwrapped[0], phases_unwrapped[-1]))
-                    phase_values = phase_interp(t)
-
-                phase_gpu = torch.from_numpy(phase_values).float().to(self.device)
+                # Phase integration on GPU
+                initial_phase = phases[0]
+                dt = 1.0 / self.sample_rate
+                phase = initial_phase + 2 * np.pi * torch.cumsum(freq_values_gpu * dt, dim=0)
 
                 # Synthesize on GPU
-                sinusoid = amp_values_gpu * torch.sin(phase_gpu)
+                sinusoid = amp_values_gpu * torch.sin(phase)
 
                 # Add to output
                 synthesized_gpu[birth_sample:death_sample+1] += sinusoid
@@ -696,7 +689,7 @@ class HybridResolutionSinusoidalExtractor:
                 if len(freq_times) == 1:
                     freq_values = np.full(n_sinusoid_samples, frequencies[0])
                 else:
-                    freq_interp = interp1d(freq_times, frequencies, kind='linear',
+                    freq_interp = interp1d(freq_times, frequencies, kind='nearest',
                                         bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
                     freq_values = freq_interp(t)
 
@@ -707,17 +700,12 @@ class HybridResolutionSinusoidalExtractor:
                     amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
                     amp_values = np.maximum(amp_values, 0)
 
-                # Interpolate phase directly (preserves phase coherence)
-                if len(freq_times) == 1:
-                    phase = np.full(n_sinusoid_samples, phases[0])
-                else:
-                    # Unwrap phases to handle 2π discontinuities
-                    phases_unwrapped = np.unwrap(phases)
-                    phase_interp = interp1d(freq_times, phases_unwrapped, kind='linear',
-                                          bounds_error=False, fill_value=(phases_unwrapped[0], phases_unwrapped[-1]))
-                    phase = phase_interp(t)
+                # Phase integration
+                initial_phase = phases[0]
+                dt = 1.0 / self.sample_rate
+                phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
 
-                # Synthesize
+                # Synthesize (no fades!)
                 sinusoid = amp_values * np.sin(phase)
 
                 # Add to output
@@ -757,7 +745,7 @@ class HybridResolutionSinusoidalExtractor:
         if len(freq_times) == 1:
             freq_values = np.full(n_sinusoid_samples, frequencies[0])
         else:
-            freq_interp = interp1d(freq_times, frequencies, kind='linear',
+            freq_interp = interp1d(freq_times, frequencies, kind='nearest',
                                 bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
             freq_values = freq_interp(t)
 
@@ -768,23 +756,18 @@ class HybridResolutionSinusoidalExtractor:
             amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
             amp_values = np.maximum(amp_values, 0)
 
-        # Interpolate phase directly (preserves phase coherence)
-        if len(freq_times) == 1:
-            phase = np.full(n_sinusoid_samples, phases[0])
-        else:
-            # Unwrap phases to handle 2π discontinuities
-            phases_unwrapped = np.unwrap(phases)
-            phase_interp = interp1d(freq_times, phases_unwrapped, kind='linear',
-                                  bounds_error=False, fill_value=(phases_unwrapped[0], phases_unwrapped[-1]))
-            phase = phase_interp(t)
-
         if self.use_gpu:
             # GPU-accelerated synthesis
+            freq_values_gpu = torch.from_numpy(freq_values).float().to(self.device)
             amp_values_gpu = torch.from_numpy(amp_values).float().to(self.device)
-            phase_gpu = torch.from_numpy(phase).float().to(self.device)
+
+            # Phase integration on GPU
+            initial_phase = phases[0]
+            dt = 1.0 / self.sample_rate
+            phase = initial_phase + 2 * np.pi * torch.cumsum(freq_values_gpu * dt, dim=0)
 
             # Synthesize on GPU
-            sinusoid = amp_values_gpu * torch.sin(phase_gpu)
+            sinusoid = amp_values_gpu * torch.sin(phase)
             sinusoid_cpu = sinusoid.cpu().numpy()
 
             # Add to output
@@ -793,6 +776,12 @@ class HybridResolutionSinusoidalExtractor:
             return synthesized
         else:
             # CPU synthesis
+            # Phase integration
+            initial_phase = phases[0]
+            dt = 1.0 / self.sample_rate
+            phase = initial_phase + 2 * np.pi * np.cumsum(freq_values * dt)
+
+            # Synthesize
             sinusoid = amp_values * np.sin(phase)
 
             # Add to output
