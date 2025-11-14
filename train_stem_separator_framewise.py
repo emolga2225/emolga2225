@@ -53,12 +53,20 @@ class FramewiseSinusoidalDataset(Dataset):
 
                     labels = self.frame_labels[track_id_str]['labels']
 
+                    # Skip tracks shorter than window size
+                    if track_len < self.window_size:
+                        continue
+
                     # Create sliding windows
                     for start_frame in range(0, track_len - self.window_size + 1, self.window_size // 2):
                         end_frame = start_frame + self.window_size
 
                         # Get labels for this window
                         window_labels = labels[start_frame:end_frame]
+
+                        # Ensure window is exactly window_size
+                        if len(window_labels) != self.window_size:
+                            continue
 
                         # Skip windows with too many unmatched frames
                         unmatched_count = sum(1 for l in window_labels if l == -1)
