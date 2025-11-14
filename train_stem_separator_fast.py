@@ -199,11 +199,11 @@ def main():
         'nhead': 8,
         'num_layers': 4,
         'window_size': 32,
-        'learning_rate': 5e-3,
-        'n_epochs': 100,
+        'learning_rate': 2e-2,
+        'n_epochs': 10,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'checkpoint_dir': 'checkpoints',
-        'save_every': 10
+        'save_every': 2
     }
 
     print("Configuration:")
@@ -244,18 +244,22 @@ def main():
 
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['n_epochs'], eta_min=1e-4)
     criterion = nn.CrossEntropyLoss(reduction='none')  # Per-sample loss for masking
 
     # Training loop
     print("\nStarting training...")
     for epoch in range(1, config['n_epochs'] + 1):
-        print(f"\nEpoch {epoch}/{config['n_epochs']}")
+        print(f"\nEpoch {epoch}/{config['n_epochs']} (lr: {scheduler.get_last_lr()[0]:.6f})")
 
         train_loss, train_acc = train_epoch(
             model, dataloader, optimizer, criterion, config['device']
         )
 
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+
+        # Step the scheduler
+        scheduler.step()
 
         # Save checkpoint
         if epoch % config['save_every'] == 0:
@@ -264,6 +268,7 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss,
                 'train_acc': train_acc,
                 'config': config
