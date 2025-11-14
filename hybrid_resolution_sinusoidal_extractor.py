@@ -626,7 +626,7 @@ class HybridResolutionSinusoidalExtractor:
                 if len(freq_times) == 1:
                     freq_values = np.full(n_sinusoid_samples, frequencies[0])
                 else:
-                    freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+                    freq_interp = interp1d(freq_times, frequencies, kind='linear',
                                         bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
                     freq_values = freq_interp(t)
 
@@ -689,7 +689,7 @@ class HybridResolutionSinusoidalExtractor:
                 if len(freq_times) == 1:
                     freq_values = np.full(n_sinusoid_samples, frequencies[0])
                 else:
-                    freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+                    freq_interp = interp1d(freq_times, frequencies, kind='linear',
                                         bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
                     freq_values = freq_interp(t)
 
@@ -745,7 +745,7 @@ class HybridResolutionSinusoidalExtractor:
         if len(freq_times) == 1:
             freq_values = np.full(n_sinusoid_samples, frequencies[0])
         else:
-            freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+            freq_interp = interp1d(freq_times, frequencies, kind='linear',
                                 bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
             freq_values = freq_interp(t)
 
