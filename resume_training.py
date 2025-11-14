@@ -17,7 +17,7 @@ import argparse
 from train_stem_separator_fast import PreprocessedStemDataset, FramewiseStemClassifier, train_epoch
 
 
-def resume_training(checkpoint_path, additional_epochs=20, new_lr=None):
+def resume_training(checkpoint_path, additional_epochs=20, new_lr=None, use_class_weights=True):
     """Resume training from a checkpoint"""
 
     print(f"Loading checkpoint from {checkpoint_path}...")
@@ -38,6 +38,7 @@ def resume_training(checkpoint_path, additional_epochs=20, new_lr=None):
     print(f"  Starting from epoch: {start_epoch}")
     print(f"  Training until epoch: {config['n_epochs']}")
     print(f"  Learning rate: {config['learning_rate']}")
+    print(f"  Class-weighted loss: {use_class_weights}")
     print(f"  Previous train loss: {checkpoint['train_loss']:.4f}")
     print(f"  Previous train acc: {checkpoint['train_acc']:.2f}%")
     print()
@@ -45,6 +46,36 @@ def resume_training(checkpoint_path, additional_epochs=20, new_lr=None):
     # Create dataset
     print("Loading dataset...")
     dataset = PreprocessedStemDataset(config['data_dir'])
+
+    # Calculate class weights if requested
+    class_weights = None
+    if use_class_weights:
+        print("\nCalculating class weights from training data...")
+
+        # Count samples per class
+        class_counts = np.zeros(6)  # 5 stems + unknown
+
+        for i in tqdm(range(len(dataset)), desc="Counting classes"):
+            sample = dataset[i]
+            labels = sample['labels'].numpy()
+            for label in labels:
+                class_counts[label] += 1
+
+        # Calculate weights (inverse frequency)
+        total = class_counts.sum()
+        class_weights_np = total / (6 * class_counts + 1e-6)  # Add epsilon to avoid division by zero
+
+        # Normalize weights
+        class_weights_np = class_weights_np / class_weights_np.sum() * 6
+
+        class_weights = torch.FloatTensor(class_weights_np).to(config['device'])
+
+        print("\nClass distribution and weights:")
+        stem_names = ['vocals', 'guitar', 'bass', 'other', 'drums', 'unknown']
+        for i, name in enumerate(stem_names):
+            pct = 100 * class_counts[i] / total
+            print(f"  {name:8s}: {class_counts[i]:10.0f} ({pct:5.2f}%) - weight: {class_weights_np[i]:.3f}")
+        print()
 
     # Create dataloader
     dataloader = DataLoader(
@@ -91,7 +122,7 @@ def resume_training(checkpoint_path, additional_epochs=20, new_lr=None):
         except:
             print("Note: Could not load scheduler state, using fresh scheduler")
 
-    criterion = nn.CrossEntropyLoss(reduction='none')
+    criterion = nn.CrossEntropyLoss(reduction='none', weight=class_weights)
 
     # Training loop
     print("\nResuming training...\n")
@@ -132,7 +163,14 @@ if __name__ == '__main__':
                         help='Additional epochs to train')
     parser.add_argument('--lr', type=float, default=None,
                         help='New learning rate (optional, defaults to checkpoint LR)')
+    parser.add_argument('--no-class-weights', action='store_true',
+                        help='Disable class-weighted loss (default: enabled)')
 
     args = parser.parse_args()
 
-    resume_training(args.checkpoint, additional_epochs=args.epochs, new_lr=args.lr)
+    resume_training(
+        args.checkpoint,
+        additional_epochs=args.epochs,
+        new_lr=args.lr,
+        use_class_weights=not args.no_class_weights
+    )
