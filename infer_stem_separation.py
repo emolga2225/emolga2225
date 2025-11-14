@@ -181,15 +181,152 @@ def classify_tracks(model, tracks_h5_path, config, device='cuda'):
     return track_predictions
 
 
-def synthesize_stems(tracks_h5_path, track_predictions, output_dir, sr=48000):
+def load_and_reconstruct_tracks(h5_file, track_ids):
+    """
+    Load tracks from HDF5 and reconstruct them for synthesis.
+
+    Returns list of track dicts with freq_times, amp_times, etc.
+    """
+    reconstructed_tracks = []
+
+    # Read global metadata
+    sample_rate = int(h5_file.attrs['sr'])
+    fft_size = int(h5_file.attrs['fft'])
+
+    # Calculate band sample rate
+    bandwidth = fft_size * (6000.0 / 1024.0)
+    band_sr = int(bandwidth * 2)
+
+    # Build track index for compact format
+    track_data_map = {}  # maps track_id -> (group_name, local_idx)
+
+    for group_name in h5_file.keys():
+        grp = h5_file[group_name]
+        if 'id' not in grp:
+            continue
+
+        track_ids_in_group = grp['id'][:]
+        for local_idx, tid in enumerate(track_ids_in_group):
+            track_data_map[int(tid)] = (group_name, local_idx)
+
+    # Load requested tracks
+    for track_id in track_ids:
+        if track_id not in track_data_map:
+            continue
+
+        group_name, local_idx = track_data_map[track_id]
+        grp = h5_file[group_name]
+
+        # Read track metadata
+        track_lens = grp['len'][:]
+        track_hops = grp['h'][:]
+
+        # Calculate offset
+        offset = sum(track_lens[:local_idx])
+        n = int(track_lens[local_idx])
+
+        # Extract track data
+        frequencies = grp['f'][offset:offset+n].tolist()
+        phases = grp['p'][offset:offset+n].tolist()
+        amplitudes = grp['a'][offset:offset+n].tolist()
+        indices = grp['i'][offset:offset+n].tolist()
+
+        # Reconstruct times from indices and hop size
+        hop_size = int(track_hops[local_idx])
+        times = (np.array(indices) * hop_size / band_sr).tolist()
+
+        track = {
+            'frequencies': frequencies,
+            'phases': phases,
+            'amplitudes': amplitudes,
+            'freq_times': times,
+            'amp_times': times,
+        }
+        reconstructed_tracks.append(track)
+
+    return reconstructed_tracks, sample_rate
+
+
+def synthesize_tracks_gpu(tracks, n_samples, sample_rate, device='cuda'):
+    """GPU-accelerated sinusoidal synthesis"""
+    import torch
+    from scipy.interpolate import interp1d
+
+    synthesized = torch.zeros(n_samples, dtype=torch.float32, device=device)
+
+    for track in tqdm(tracks, desc="    Synthesizing"):
+        freq_times = np.array(track['freq_times'])
+        frequencies = np.array(track['frequencies'])
+        amp_times = np.array(track['amp_times'])
+        amplitudes = np.array(track['amplitudes'])
+        phases = np.array(track['phases'])
+
+        if len(freq_times) < 1 or len(amplitudes) < 1:
+            continue
+
+        # Use exact birth/death times
+        birth_time = freq_times[0]
+        death_time = freq_times[-1]
+
+        birth_sample = int(birth_time * sample_rate)
+        death_sample = int(death_time * sample_rate)
+
+        birth_sample = max(0, birth_sample)
+        death_sample = min(n_samples - 1, death_sample)
+
+        if birth_sample >= death_sample:
+            continue
+
+        n_sinusoid_samples = death_sample - birth_sample + 1
+        t = np.arange(n_sinusoid_samples) / sample_rate + birth_time
+
+        # Interpolate frequency
+        if len(freq_times) == 1:
+            freq_values = np.full(n_sinusoid_samples, frequencies[0])
+        else:
+            freq_interp = interp1d(freq_times, frequencies, kind='nearest',
+                                bounds_error=False, fill_value=(frequencies[0], frequencies[-1]))
+            freq_values = freq_interp(t)
+
+        # Interpolate amplitude
+        if len(amp_times) == 1:
+            amp_values = np.full(n_sinusoid_samples, amplitudes[0])
+        else:
+            amp_values = np.interp(t, amp_times, amplitudes, left=0, right=0)
+            amp_values = np.maximum(amp_values, 0)
+
+        # Transfer to GPU
+        freq_values_gpu = torch.from_numpy(freq_values).float().to(device)
+        amp_values_gpu = torch.from_numpy(amp_values).float().to(device)
+
+        # Phase integration on GPU
+        initial_phase = phases[0]
+        dt = 1.0 / sample_rate
+        phase = initial_phase + 2 * np.pi * torch.cumsum(freq_values_gpu * dt, dim=0)
+
+        # Synthesize on GPU
+        sinusoid = amp_values_gpu * torch.sin(phase)
+
+        # Add to output
+        synthesized[birth_sample:death_sample+1] += sinusoid
+
+    return synthesized.cpu().numpy()
+
+
+def synthesize_stems(tracks_h5_path, track_predictions, output_dir, use_gpu=True):
     """
     Synthesize separate audio files for each stem.
 
     Groups tracks by predicted stem and synthesizes audio.
     """
+    import soundfile as sf
+
     print(f"\nSynthesizing stems to {output_dir}...")
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
+
+    device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
 
     # Group tracks by stem
     stem_tracks = {i: [] for i in range(6)}  # 0-4: stems, 5: unknown
@@ -205,20 +342,59 @@ def synthesize_stems(tracks_h5_path, track_predictions, output_dir, sr=48000):
 
     # Synthesize each stem
     with h5py.File(tracks_h5_path, 'r') as f:
+        # Get audio length from metadata or estimate
+        sample_rate = int(f.attrs['sr'])
+
+        # Estimate n_samples from track data
+        max_end_time = 0
+        for group_name in f.keys():
+            if 'i' in f[group_name] and 'h' in f[group_name]:
+                grp = f[group_name]
+                indices = grp['i'][:]
+                hops = grp['h'][:]
+                if len(indices) > 0 and len(hops) > 0:
+                    fft_size = int(f.attrs['fft'])
+                    bandwidth = fft_size * (6000.0 / 1024.0)
+                    band_sr = int(bandwidth * 2)
+                    max_idx = np.max(indices)
+                    max_hop = np.max(hops)
+                    end_time = max_idx * max_hop / band_sr
+                    max_end_time = max(max_end_time, end_time)
+
+        n_samples = int(max_end_time * sample_rate) + sample_rate  # Add 1 second buffer
+        print(f"\nAudio length: {n_samples / sample_rate:.2f} seconds ({sample_rate} Hz)")
+
         for stem_idx, track_ids in stem_tracks.items():
             if len(track_ids) == 0:
                 continue
 
             stem_name = STEM_NAMES[stem_idx] if stem_idx < 5 else 'unknown'
-            print(f"\nSynthesizing {stem_name}...")
+            print(f"\n  {stem_name}: {len(track_ids)} tracks")
 
-            # TODO: Implement actual synthesis
-            # For now, just create a placeholder
-            # You'll need to use your existing synthesis code from HybridResolutionSinusoidalExtractor
+            # Load and reconstruct tracks
+            tracks, sr = load_and_reconstruct_tracks(f, track_ids)
 
-            print(f"  Would synthesize {len(track_ids)} tracks for {stem_name}")
-            # audio = synthesize_sinusoidal_tracks(f, track_ids, sr)
-            # sf.write(output_path / f'{stem_name}.wav', audio, sr)
+            if len(tracks) == 0:
+                print(f"    No tracks to synthesize")
+                continue
+
+            # Synthesize
+            if use_gpu and torch.cuda.is_available():
+                audio = synthesize_tracks_gpu(tracks, n_samples, sr, device=device)
+            else:
+                # CPU fallback (implement if needed)
+                print(f"    CPU synthesis not implemented, skipping...")
+                continue
+
+            # Normalize
+            max_val = np.abs(audio).max()
+            if max_val > 0:
+                audio = audio / max_val * 0.95  # Prevent clipping
+
+            # Save
+            output_file = output_path / f'{stem_name}.wav'
+            sf.write(output_file, audio, sr)
+            print(f"    ✓ Saved to {output_file}")
 
     print("\nStem synthesis complete!")
 
