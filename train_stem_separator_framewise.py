@@ -11,17 +11,19 @@ import json
 class FramewiseSinusoidalDataset(Dataset):
     """Dataset for frame-level sinusoidal track-to-stem mapping"""
 
-    def __init__(self, mix_h5_file, frame_labels_file, n_stems, window_size=32):
+    def __init__(self, mix_h5_file, frame_labels_file, n_stems, window_size=32, augment=True):
         """
         Args:
             mix_h5_file: HDF5 file containing mix sinusoids
             frame_labels_file: JSON file with frame-level labels
             n_stems: Number of stem classes
             window_size: Number of frames in each training window
+            augment: Whether to apply data augmentation to prevent overfitting
         """
         self.mix_h5_file = mix_h5_file
         self.n_stems = n_stems
         self.window_size = window_size
+        self.augment = augment
 
         # Load frame labels
         with open(frame_labels_file, 'r') as f:
@@ -112,6 +114,25 @@ class FramewiseSinusoidalDataset(Dataset):
             phases = all_phases[start:end]
             band = track_bands[window_info['track_idx']]
 
+        # Apply data augmentation to prevent overfitting
+        if self.augment:
+            # Add small random perturbations to prevent memorization
+            # Frequency jitter: ±2%
+            freq_jitter = np.random.uniform(0.98, 1.02, size=len(freqs))
+            freqs = freqs * freq_jitter
+
+            # Amplitude jitter: ±10% (in log space for better distribution)
+            amp_jitter = np.random.uniform(-0.1, 0.1, size=len(amps))
+            amps = amps * np.exp(amp_jitter)
+
+            # Phase jitter: ±π/8
+            phase_jitter = np.random.uniform(-np.pi/8, np.pi/8, size=len(phases))
+            phases = phases + phase_jitter
+
+            # Random amplitude scaling of entire window: 0.8-1.2x
+            global_amp_scale = np.random.uniform(0.8, 1.2)
+            amps = amps * global_amp_scale
+
         # Create feature matrix [window_size, n_features]
         features = np.zeros((self.window_size, 4), dtype=np.float32)
 
@@ -120,6 +141,11 @@ class FramewiseSinusoidalDataset(Dataset):
         features[:actual_len, 1] = np.log1p(amps)   # Log amplitude
         features[:actual_len, 2] = np.cos(phases)   # Phase cos
         features[:actual_len, 3] = np.sin(phases)   # Phase sin
+
+        # Add Gaussian noise to features during training
+        if self.augment:
+            noise = np.random.normal(0, 0.01, features.shape).astype(np.float32)
+            features = features + noise
 
         # Create mask for valid frames
         mask = np.zeros(self.window_size, dtype=np.float32)
@@ -155,21 +181,21 @@ class FramewiseStemClassifier(nn.Module):
         # Positional encoding
         self.pos_encoding = nn.Parameter(torch.randn(window_size, d_model))
 
-        # Transformer encoder
+        # Transformer encoder with increased dropout to prevent overfitting
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=d_model * 4,
-            dropout=0.1,
+            dropout=0.3,  # Increased from 0.1 to prevent memorization
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Frame-level classification head
+        # Frame-level classification head with higher dropout
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),  # Increased from 0.1
             nn.Linear(d_model, self.n_stems)
         )
 
@@ -207,6 +233,30 @@ class FramewiseStemClassifier(nn.Module):
         return logits
 
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    """Cross entropy loss with label smoothing to prevent overconfidence"""
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: [N, C] logits
+            target: [N] class indices
+        """
+        pred = pred.log_softmax(dim=-1)
+        n_class = pred.size(-1)
+
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (n_class - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+
+        return torch.mean(torch.sum(-true_dist * pred, dim=-1))
+
+
 def train_epoch(model, dataloader, optimizer, criterion, device):
     """Train for one epoch"""
     model.train()
@@ -231,9 +281,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         labels_flat = labels.reshape(-1)  # [batch*window_size]
         mask_flat = mask.reshape(-1)  # [batch*window_size]
 
-        # Compute loss only on valid frames
-        loss = criterion(logits_flat, labels_flat)
-        loss = (loss * mask_flat).sum() / mask_flat.sum()
+        # Filter to only valid frames
+        valid_mask = mask_flat > 0
+        if valid_mask.sum() == 0:
+            continue
+
+        logits_valid = logits_flat[valid_mask]
+        labels_valid = labels_flat[valid_mask]
+
+        # Compute loss with label smoothing
+        loss = criterion(logits_valid, labels_valid)
 
         # Backward pass
         loss.backward()
@@ -241,24 +298,20 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
 
         # Stats (only on valid frames)
         total_loss += loss.item()
-        _, predicted = logits_flat.max(1)
+        _, predicted = logits_valid.max(1)
+        correct += predicted.eq(labels_valid).sum().item()
+        total += labels_valid.size(0)
 
-        valid_mask = mask_flat > 0
-        if valid_mask.sum() > 0:
-            correct += predicted[valid_mask].eq(labels_flat[valid_mask]).sum().item()
-            total += valid_mask.sum().item()
-
-        if total > 0:
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.*correct/total:.2f}%'
-            })
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100.*correct/total:.2f}%'
+        })
 
     return total_loss / len(dataloader), 100. * correct / total if total > 0 else 0
 
 
 def main():
-    # Configuration
+    # Configuration with anti-overfitting settings
     config = {
         'stem_names': ['vocals', 'guitar', 'bass', 'drums'],
         'window_size': 32,
@@ -267,8 +320,11 @@ def main():
         'num_layers': 4,
         'batch_size': 64,
         'learning_rate': 1e-4,
+        'weight_decay': 0.01,  # L2 regularization to prevent overfitting
+        'label_smoothing': 0.1,  # Prevent overconfidence
         'num_epochs': 100,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'augment': True  # Enable data augmentation
     }
 
     print("Frame-wise Stem Separator Training")
@@ -281,11 +337,13 @@ def main():
 
     # Create dataset and dataloader
     print("\nCreating dataset...")
+    print(f"Data augmentation: {'enabled' if config['augment'] else 'disabled'}")
     dataset = FramewiseSinusoidalDataset(
         mix_h5_file=mix_h5_file,
         frame_labels_file=frame_labels_file,
         n_stems=len(config['stem_names']),
-        window_size=config['window_size']
+        window_size=config['window_size'],
+        augment=config['augment']
     )
 
     dataloader = DataLoader(
@@ -309,9 +367,20 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
 
-    # Loss and optimizer (use reduction='none' for per-frame loss)
-    criterion = nn.CrossEntropyLoss(reduction='none')
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])
+    # Loss with label smoothing to prevent overconfidence
+    print(f"\nRegularization settings:")
+    print(f"  Label smoothing: {config['label_smoothing']}")
+    print(f"  Weight decay: {config['weight_decay']}")
+    print(f"  Dropout: 0.3")
+
+    criterion = LabelSmoothingCrossEntropy(smoothing=config['label_smoothing'])
+
+    # Optimizer with weight decay (L2 regularization)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay']
+    )
 
     # Training loop
     print("\nStarting training...")

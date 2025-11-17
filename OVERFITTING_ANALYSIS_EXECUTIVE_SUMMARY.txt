@@ -1,0 +1,321 @@
+================================================================================
+STEM SEPARATION ML PROJECT - EXECUTIVE SUMMARY
+================================================================================
+
+PROJECT: Music stem separation using sinusoidal track classification
+BRANCH: claude/fix-stem-overfitting-01GrQkqnAVyTZntm7GgWXZLQ
+LOCATION: /home/user/emolga2225
+
+================================================================================
+1. PROJECT TYPE & STRUCTURE
+================================================================================
+
+GOAL: Classify sinusoidal tracks from a music mix into individual stems
+      (vocals, drums, bass, guitar, other)
+
+PIPELINE:
+  Audio → Sinusoidal Extraction → Frame-level Matching → Preprocessing → 
+  Training → Model → Inference → Separated Stems
+
+KEY FILES:
+  - hybrid_resolution_sinusoidal_extractor.py (859 lines) - Audio analysis
+  - match_stems_framewise.py (242 lines) - Label generation [CRITICAL]
+  - preprocess_training_data.py (209 lines) - Data preparation [CRITICAL]
+  - train_stem_separator_fast.py (282 lines) - Model training [CRITICAL]
+  - infer_stem_separation.py (523 lines) - Inference/synthesis
+
+TOTAL CODE: ~4,510 lines Python
+
+================================================================================
+2. MODEL ARCHITECTURE
+================================================================================
+
+NAME: FramewiseStemClassifier (Transformer-based)
+
+INPUT:  [batch, 32_frames, 4_features]
+        Features: normalized_frequency, log_amplitude, cos(phase), sin(phase)
+
+ARCHITECTURE:
+  - Input Projection: Linear(4 → 128)
+  - Band Embedding: Embedding(32_bands → 128)
+  - Positional Encoding: Learnable parameter (32 × 128)
+  - Transformer Encoder: 4 layers, 8 heads, 128 dims, dropout=0.1
+  - Classification Head: Linear(128 → 128) → ReLU → Dropout → Linear(128 → 5)
+
+OUTPUT: [batch, 32_frames, 5_stems] per-frame predictions
+
+PARAMETERS: ~65,000
+
+================================================================================
+3. ROOT CAUSE OF OVERFITTING - "EXCESS PRECISE DATA"
+================================================================================
+
+PRIMARY CAUSE #1: Deterministic Label Generation
+  Location: match_stems_framewise.py (lines 61-106)
+  Problem:
+    - Frame-by-frame matching uses HARD frequency threshold (100 Hz)
+    - Binary decision: match OR no-match (score > 0.1)
+    - Same sinusoid → always same stem label (deterministic)
+    - Real world has ambiguity; model given FALSE certainty
+    - No soft labels, no confidence scores
+
+PRIMARY CAUSE #2: Data Augmentation Gap
+  Location: preprocess_training_data.py + train_stem_separator_fast.py
+  Problem:
+    - ZERO data augmentation applied to features
+    - Frequencies, amplitudes, phases unchanged each epoch
+    - Window overlap (50%) means same frames appear multiple times
+    - Window stride=16, size=32 → frames 1-32 in window 1, 
+                                    frames 2-33 in window 2, etc.
+
+PRIMARY CAUSE #3: Window-Level Filtering
+  Location: preprocess_training_data.py (lines 73-78)
+  Problem:
+    - Skips windows with >50% unmatched frames
+    - Only includes "easy" well-matched data
+    - No hard negative examples for model to learn from
+    - Biases toward overconfident matching
+
+SECONDARY CAUSE #4: Insufficient Regularization
+  Issues:
+    ✓ Dropout: 0.1 (very low)
+    ✓ Mask-based filtering
+    ✗ NO L1/L2 weight decay
+    ✗ NO batch/layer normalization
+    ✗ NO mixup/cutmix
+    ✗ NO label smoothing
+    ✗ NO early stopping mechanism
+    ✗ NO validation set (100% train, 0% validation)
+
+SECONDARY CAUSE #5: Learning Rate Instability
+  Git history shows: 1e-3 → 5e-3 → 1e-2 → 5e-3 → 1e-4
+  Indicates: Multiple unsuccessful tuning attempts
+  Effect: No stable convergence, overfitting became harder to control
+
+================================================================================
+4. CRITICAL CODE ISSUES
+================================================================================
+
+ISSUE #1: Hard Matching Threshold
+  File: /home/user/emolga2225/match_stems_framewise.py:104
+  Code: if best_score > 0.1:
+            return best_stem
+        return -1
+  Impact: Binary labels with no uncertainty
+  Fix: Add confidence scores, use soft labels (KL divergence)
+
+ISSUE #2: Window Filtering
+  File: /home/user/emolga2225/preprocess_training_data.py:73
+  Code: if matched_count < window_size * match_threshold:
+            continue
+  Impact: Only trains on easy examples
+  Fix: Include hard examples, weight by confidence
+
+ISSUE #3: No Weight Decay
+  File: /home/user/emolga2225/train_stem_separator_fast.py:246
+  Code: optimizer = torch.optim.Adam(model.parameters(), lr=...)
+  Impact: No L2 regularization on weights
+  Fix: Add weight_decay=0.01 or use AdamW
+
+ISSUE #4: No Data Augmentation
+  File: /home/user/emolga2225/train_stem_separator_fast.py:61-68
+  Code: return {
+            'features': torch.from_numpy(self.features[idx].copy()),
+            ...
+        }
+  Impact: Identical features every epoch
+  Fix: Add jitter to frequencies, amplitudes, phases
+
+ISSUE #5: No Validation Split
+  File: /home/user/emolga2225/train_stem_separator_fast.py:222-229
+  Code: No validation_split parameter
+  Impact: Can't detect overfitting
+  Fix: Create 80% train / 20% validation split
+
+ISSUE #6: Unknown Class Weight Capping
+  File: /home/user/emolga2225/resume_training.py:73
+  Code: class_weights_np[5] = 1.0  # Hard cap
+  Impact: Under-weights uncertain/unmatched frames
+  Fix: Remove cap, let class weights learn naturally
+
+================================================================================
+5. DATA PIPELINE WITH OVERFITTING POINTS
+================================================================================
+
+                    Audio Files (.ogg)
+                           ↓
+    ╔═══════════════════════════════════════════════════════════╗
+    ║ Step 1: Sinusoidal Extraction                              ║
+    ║ File: hybrid_resolution_sinusoidal_extractor.py            ║
+    ║ Outputs: fullmix_tracks.h5, vocals_tracks.h5, etc.         ║
+    ║ Per-frame data: frequency, amplitude, phase                ║
+    ╚═══════════════════════════════════════════════════════════╝
+                           ↓
+    ╔═══════════════════════════════════════════════════════════╗
+    ║ Step 2: Frame-Level Matching [OVERFITTING POINT #1]       ║
+    ║ File: match_stems_framewise.py                             ║
+    ║ Problem: Hard threshold, no soft labels                    ║
+    ║ Outputs: frame_labels.json (deterministic, no uncertainty) ║
+    ╚═══════════════════════════════════════════════════════════╝
+                           ↓
+    ╔═══════════════════════════════════════════════════════════╗
+    ║ Step 3: Preprocessing [OVERFITTING POINT #2]              ║
+    ║ File: preprocess_training_data.py                          ║
+    ║ Problems:                                                   ║
+    ║   - Window filtering (skip hard examples)                   ║
+    ║   - No augmentation                                         ║
+    ║   - 50% overlap (frame duplication)                         ║
+    ║ Outputs: features.npy, labels.npy, masks.npy               ║
+    ╚═══════════════════════════════════════════════════════════╝
+                           ↓
+    ╔═══════════════════════════════════════════════════════════╗
+    ║ Step 4: Training [OVERFITTING POINT #3]                   ║
+    ║ File: train_stem_separator_fast.py                         ║
+    ║ Problems:                                                   ║
+    ║   - No weight decay                                         ║
+    ║   - No data augmentation                                    ║
+    ║   - No validation split                                     ║
+    ║   - Only training metrics (can't see overfitting)           ║
+    ║ Config: Adam, LR=5e-3, Epochs=10, Batch=256                ║
+    ╚═══════════════════════════════════════════════════════════╝
+                           ↓
+                  Trained Model
+                  (overfits to training patterns)
+
+================================================================================
+6. DATASET CHARACTERISTICS
+================================================================================
+
+Training Set Size: 50,000+ windows
+Sample Size: 32 frames per sample = 32 sinusoids
+Features per Frame: 4 (frequency, log_amplitude, cos(phase), sin(phase))
+Classes: 5 stems (vocals, guitar, bass, drums, other) + 1 unknown
+
+DATA QUALITY:
+  - Deterministic labels (no probabilistic uncertainty)
+  - Hard thresholds (frequency ±100 Hz)
+  - No built-in noise or natural variation
+  - Window filtering removes "difficult" examples
+  - 50% overlap creates frame repetition
+
+RESULT: Clean but biased training data that doesn't represent
+        real-world ambiguity or variation
+
+================================================================================
+7. TRAINING VARIANTS COMPARISON
+================================================================================
+
+train_stem_separator_framewise.py:
+  - Loads directly from HDF5 files
+  - Learning rate: 1e-4
+  - Epochs: 100
+  - Batch size: 64
+  - Speed: SLOW (HDF5 I/O per batch)
+  - Issues: No scheduler, no validation
+
+train_stem_separator_fast.py:
+  - Loads from preprocessed numpy arrays
+  - Learning rate: 5e-3
+  - Epochs: 10
+  - Batch size: 256
+  - Speed: FAST (memory-mapped arrays)
+  - Features: Cosine annealing scheduler
+  - Issues: No weight decay, no validation, no augmentation
+
+resume_training.py:
+  - Resumes from checkpoint
+  - Supports class-weighted loss
+  - Issues: Caps unknown class weight to 1.0
+
+================================================================================
+8. KEY FINDINGS SUMMARY
+================================================================================
+
+Root Cause of Overfitting:
+  The combination of:
+    1. Deterministic hard-threshold label matching (no uncertainty)
+    2. Lack of data augmentation (identical features each epoch)
+    3. Window filtering that excludes hard examples
+    4. No regularization beyond minimal dropout
+    5. No validation set to detect overfitting
+
+This creates a "too clean" training set that doesn't represent
+the real variability in sinusoid matching.
+
+Evidence from Git History:
+  - Multiple learning rate adjustments (1e-3 → 5e-3 → 1e-2 → 1e-4)
+  - Indicates developers noticed overfitting issues
+  - Attempted solutions: class weights, learning rate reduction
+  - No systematic approach to addressing root causes
+
+================================================================================
+9. RECOMMENDATIONS (Priority Order)
+================================================================================
+
+HIGH PRIORITY (Address Root Cause):
+  1. Soft Label Matching:
+     - Return confidence scores (0.0-1.0) not binary labels
+     - Use KL divergence loss for soft targets
+     - File: match_stems_framewise.py
+
+  2. Data Augmentation:
+     - Add frequency jitter (±5 Hz)
+     - Add amplitude jitter (±5%)
+     - Add phase jitter
+     - File: train_stem_separator_fast.py
+
+  3. Include Hard Examples:
+     - Remove >50% unmatched window filter
+     - Weight windows by match confidence
+     - File: preprocess_training_data.py
+
+MEDIUM PRIORITY (Reduce Overfitting):
+  4. Add Weight Decay: optimizer → weight_decay=0.01
+  5. Validation Split: 80% train, 20% validation
+  6. Increase Dropout: 0.1 → 0.3
+  7. Remove Unknown Weight Cap: resume_training.py line 73
+
+LOW PRIORITY (Optimization):
+  8. Reduce model capacity (fewer transformer layers)
+  9. Better learning rate scheduling
+ 10. Label smoothing
+
+================================================================================
+10. FILES TO EXAMINE/MODIFY
+================================================================================
+
+Critical Priority:
+  [ ] /home/user/emolga2225/match_stems_framewise.py
+  [ ] /home/user/emolga2225/preprocess_training_data.py
+  [ ] /home/user/emolga2225/train_stem_separator_fast.py
+
+Important:
+  [ ] /home/user/emolga2225/resume_training.py
+  [ ] /home/user/emolga2225/train_stem_separator_framewise.py
+
+Reference:
+  [ ] /home/user/emolga2225/hybrid_resolution_sinusoidal_extractor.py
+  [ ] /home/user/emolga2225/infer_stem_separation.py
+  [ ] /home/user/emolga2225/STEM_TRAINING_README.md
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The overfitting is caused by EXCESS PRECISE DATA combined with insufficient
+regularization and no validation metrics.
+
+The labels are created deterministically with hard thresholds, creating
+false confidence. Combined with no data augmentation and selective window
+filtering, the model sees a "too clean" representation of sinusoid-to-stem
+mapping that doesn't reflect real-world variation.
+
+Solutions require changes at multiple levels:
+  1. Data generation: Soft labels with uncertainty
+  2. Data preparation: Include hard examples, add augmentation
+  3. Model training: Add regularization, validation split
+
+The most impactful single change would be soft-label matching with confidence
+scores instead of binary labels.
+
+================================================================================
