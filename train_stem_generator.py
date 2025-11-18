@@ -42,10 +42,27 @@ class StemGenerationDataset(Dataset):
         # Load full audio files
         print("Loading audio files...")
         self.fullmix = self._load_audio(self.data_dir / 'fullmix.ogg')
-        self.stems = {
-            name: self._load_audio(self.data_dir / f'{name}.ogg')
-            for name in stem_names
-        }
+        self.stems = {}
+
+        for name in stem_names:
+            if name == 'drums':
+                # Drums are split into 4 files - combine them
+                print(f"  Loading {name} (4 files)...")
+                drum_files = [f'drums_{i}.ogg' for i in range(1, 5)]
+                drums_combined = None
+
+                for drum_file in drum_files:
+                    drum_audio = self._load_audio(self.data_dir / drum_file)
+                    if drums_combined is None:
+                        drums_combined = drum_audio
+                    else:
+                        # Sum the drum tracks
+                        drums_combined = drums_combined + drum_audio
+
+                self.stems[name] = drums_combined
+            else:
+                print(f"  Loading {name}.ogg...")
+                self.stems[name] = self._load_audio(self.data_dir / f'{name}.ogg')
 
         # Calculate number of segments
         self.n_segments = len(self.fullmix) // self.segment_samples
