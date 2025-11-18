@@ -9,7 +9,7 @@ from tqdm import tqdm
 import json
 
 class FramewiseSinusoidalDataset(Dataset):
-    """Dataset for frame-level sinusoidal track-to-stem mapping"""
+    """Dataset for frame-level sinusoidal track-to-stem mapping with multi-worker support"""
 
     def __init__(self, mix_h5_file, frame_labels_file, n_stems, window_size=32, augment=True):
         """
@@ -24,6 +24,7 @@ class FramewiseSinusoidalDataset(Dataset):
         self.n_stems = n_stems
         self.window_size = window_size
         self.augment = augment
+        self._h5_file = None  # Per-worker file handle
 
         # Load frame labels
         with open(frame_labels_file, 'r') as f:
@@ -32,6 +33,12 @@ class FramewiseSinusoidalDataset(Dataset):
         # Build index of all training windows
         self.windows = []
         self._build_index()
+
+    def _get_h5_file(self):
+        """Get HDF5 file handle for current worker"""
+        if self._h5_file is None:
+            self._h5_file = h5py.File(self.mix_h5_file, 'r')
+        return self._h5_file
 
     def _build_index(self):
         """Build index of all sliding windows"""
@@ -92,27 +99,28 @@ class FramewiseSinusoidalDataset(Dataset):
         """Get a single training window"""
         window_info = self.windows[idx]
 
-        with h5py.File(self.mix_h5_file, 'r') as f:
-            grp = f[f'c{window_info["channel"]}']
+        # Use per-worker file handle for multi-worker DataLoader
+        f = self._get_h5_file()
+        grp = f[f'c{window_info["channel"]}']
 
-            track_lens = grp['len'][:]
-            track_bands = grp['b'][:]
+        track_lens = grp['len'][:]
+        track_bands = grp['b'][:]
 
-            all_freqs = grp['f'][:]
-            all_amps = grp['a'][:]
-            all_phases = grp['p'][:]
+        all_freqs = grp['f'][:]
+        all_amps = grp['a'][:]
+        all_phases = grp['p'][:]
 
-            # Find offset for this track
-            offset = sum(track_lens[:window_info['track_idx']])
+        # Find offset for this track
+        offset = sum(track_lens[:window_info['track_idx']])
 
-            # Extract window data
-            start = offset + window_info['start_frame']
-            end = offset + window_info['end_frame']
+        # Extract window data
+        start = offset + window_info['start_frame']
+        end = offset + window_info['end_frame']
 
-            freqs = all_freqs[start:end]
-            amps = all_amps[start:end]
-            phases = all_phases[start:end]
-            band = track_bands[window_info['track_idx']]
+        freqs = all_freqs[start:end]
+        amps = all_amps[start:end]
+        phases = all_phases[start:end]
+        band = track_bands[window_info['track_idx']]
 
         # Apply data augmentation to prevent overfitting
         if self.augment:
@@ -374,8 +382,10 @@ def main():
         dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=0,  # Disable multiprocessing for HDF5 compatibility
-        pin_memory=True if config['device'] == 'cuda' else False
+        num_workers=4,  # Parallel data loading (each worker gets own HDF5 handle)
+        pin_memory=True if config['device'] == 'cuda' else False,
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=2  # Prefetch batches to keep GPU busy
     )
 
     # Create model
