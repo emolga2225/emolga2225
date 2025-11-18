@@ -239,6 +239,15 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         # Forward pass: generate stem spectrograms
         generated_stems = model(mix_spec)
 
+        # Resize generated stems to match target size (handles slight dimension mismatches from U-Net)
+        if generated_stems.shape != stem_specs.shape:
+            generated_stems = torch.nn.functional.interpolate(
+                generated_stems,
+                size=stem_specs.shape[2:],  # Match [freq, time] dimensions
+                mode='bilinear',
+                align_corners=False
+            )
+
         # Loss: L1 distance between generated and ground truth stem spectrograms
         loss = criterion(generated_stems, stem_specs)
 
