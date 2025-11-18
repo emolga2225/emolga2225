@@ -19,54 +19,75 @@ from pathlib import Path
 from tqdm import tqdm
 
 class StemGenerationDataset(Dataset):
-    """Dataset that loads fullmix + stem audio and computes spectrograms"""
+    """Dataset that loads fullmix + stem audio from multiple songs"""
 
-    def __init__(self, data_dir, stem_names, sample_rate=44100, n_fft=2048,
+    def __init__(self, data_dirs, stem_names, sample_rate=44100, n_fft=2048,
                  hop_length=512, segment_length=4.0):
         """
         Args:
-            data_dir: Directory containing fullmix.ogg and stem .ogg files
+            data_dirs: List of directories, each containing fullmix.ogg and stem .ogg files
             stem_names: List of stem names (e.g., ['vocals', 'guitar', 'bass', 'drums'])
             sample_rate: Audio sample rate
             n_fft: FFT size for spectrogram
             hop_length: Hop length for STFT
             segment_length: Length of audio segments in seconds
         """
-        self.data_dir = Path(data_dir)
+        if isinstance(data_dirs, str):
+            data_dirs = [data_dirs]
+
+        self.data_dirs = [Path(d) for d in data_dirs]
         self.stem_names = stem_names
         self.sr = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.segment_samples = int(segment_length * sample_rate)
 
-        # Load full audio files
-        print("Loading audio files...")
-        self.fullmix = self._load_audio(self.data_dir / 'fullmix.ogg')
-        self.stems = {}
+        # Load audio from all songs
+        print(f"Loading audio files from {len(self.data_dirs)} song(s)...")
+        self.songs = []
 
-        for name in stem_names:
-            if name == 'drums':
-                # Drums are split into 4 files - combine them
-                print(f"  Loading {name} (4 files)...")
-                drum_files = [f'drums_{i}.ogg' for i in range(1, 5)]
-                drums_combined = None
+        for data_dir in self.data_dirs:
+            print(f"\n  Loading from {data_dir.name}...")
+            fullmix = self._load_audio(data_dir / 'fullmix.ogg')
+            stems = {}
 
-                for drum_file in drum_files:
-                    drum_audio = self._load_audio(self.data_dir / drum_file)
-                    if drums_combined is None:
-                        drums_combined = drum_audio
-                    else:
-                        # Sum the drum tracks
-                        drums_combined = drums_combined + drum_audio
+            for name in stem_names:
+                if name == 'drums':
+                    # Drums are split into 4 files - combine them
+                    drum_files = [f'drums_{i}.ogg' for i in range(1, 5)]
+                    drums_combined = None
 
-                self.stems[name] = drums_combined
-            else:
-                print(f"  Loading {name}.ogg...")
-                self.stems[name] = self._load_audio(self.data_dir / f'{name}.ogg')
+                    for drum_file in drum_files:
+                        drum_path = data_dir / drum_file
+                        if drum_path.exists():
+                            drum_audio = self._load_audio(drum_path)
+                            if drums_combined is None:
+                                drums_combined = drum_audio
+                            else:
+                                drums_combined = drums_combined + drum_audio
 
-        # Calculate number of segments (use length of first channel)
-        self.n_segments = self.fullmix.shape[1] // self.segment_samples
-        print(f"Created {self.n_segments} segments from audio")
+                    if drums_combined is not None:
+                        stems[name] = drums_combined
+                else:
+                    stem_path = data_dir / f'{name}.ogg'
+                    if stem_path.exists():
+                        stems[name] = self._load_audio(stem_path)
+
+            # Calculate segments for this song
+            n_segments = fullmix.shape[1] // self.segment_samples
+
+            self.songs.append({
+                'fullmix': fullmix,
+                'stems': stems,
+                'n_segments': n_segments,
+                'dir': data_dir
+            })
+
+            print(f"    Loaded {n_segments} segments")
+
+        # Calculate total segments across all songs
+        self.total_segments = sum(song['n_segments'] for song in self.songs)
+        print(f"\nTotal segments across all songs: {self.total_segments}")
 
     def _load_audio(self, path):
         """Load audio file as stereo"""
@@ -91,19 +112,29 @@ class StemGenerationDataset(Dataset):
         return log_mag
 
     def __len__(self):
-        return self.n_segments
+        return self.total_segments
 
     def __getitem__(self, idx):
-        """Get a training segment"""
-        start = idx * self.segment_samples
-        end = start + self.segment_samples
+        """Get a training segment from any song"""
+        # Find which song this segment belongs to
+        cumulative = 0
+        for song in self.songs:
+            if idx < cumulative + song['n_segments']:
+                # This segment is from this song
+                segment_idx = idx - cumulative
+                start = segment_idx * self.segment_samples
+                end = start + self.segment_samples
 
-        # Extract audio segments (handle stereo: [2, samples])
-        mix_segment = self.fullmix[:, start:end]
-        stem_segments = {
-            name: audio[:, start:end]
-            for name, audio in self.stems.items()
-        }
+                # Extract audio segments (handle stereo: [2, samples])
+                mix_segment = song['fullmix'][:, start:end]
+                stem_segments = {
+                    name: audio[:, start:end]
+                    for name, audio in song['stems'].items()
+                }
+                break
+            cumulative += song['n_segments']
+        else:
+            raise IndexError(f"Segment index {idx} out of range")
 
         # Compute spectrograms
         mix_spec = self._compute_spectrogram(mix_segment)
@@ -126,7 +157,13 @@ class StemGenerationDataset(Dataset):
 class UNetStemGenerator(nn.Module):
     """U-Net architecture for generating stem spectrograms from fullmix"""
 
-    def __init__(self, n_stems=4, in_channels=1, base_channels=32):
+    def __init__(self, n_stems=4, in_channels=1, base_channels=64):
+        """
+        Args:
+            n_stems: Number of stems to generate
+            in_channels: Input channels (1 for mono spectrogram)
+            base_channels: Base number of channels (increased to 64 for more capacity)
+        """
         super().__init__()
 
         self.n_stems = n_stems
@@ -271,27 +308,41 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Train generative stem separator')
+    parser.add_argument('--data-dirs', nargs='+', default=['.'],
+                       help='Directories containing song data')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Checkpoint to resume training from')
+    parser.add_argument('--epochs', type=int, default=1000,
+                       help='Number of epochs to train')
+    parser.add_argument('--batch-size', type=int, default=16,
+                       help='Batch size')
+    args = parser.parse_args()
+
     config = {
         'stem_names': ['vocals', 'guitar', 'bass', 'drums'],
-        'data_dir': '.',  # Current directory
+        'data_dirs': args.data_dirs,
         'sample_rate': 44100,
         'n_fft': 2048,
         'hop_length': 512,
-        'segment_length': 4.0,  # 4 second segments
-        'batch_size': 8,
+        'segment_length': 4.0,
+        'batch_size': args.batch_size,
         'learning_rate': 1e-4,
-        'num_epochs': 100,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'num_epochs': args.epochs,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'base_channels': 64  # Increased capacity
     }
 
     print("Generative Stem Separator Training")
     print(f"Device: {config['device']}")
     print(f"Stems: {config['stem_names']}")
+    print(f"Data directories: {config['data_dirs']}")
 
     # Create dataset
     print("\nCreating dataset...")
     dataset = StemGenerationDataset(
-        data_dir=config['data_dir'],
+        data_dirs=config['data_dirs'],
         stem_names=config['stem_names'],
         sample_rate=config['sample_rate'],
         n_fft=config['n_fft'],
@@ -312,19 +363,29 @@ def main():
     model = UNetStemGenerator(
         n_stems=len(config['stem_names']),
         in_channels=1,
-        base_channels=32
+        base_channels=config['base_channels']
     ).to(config['device'])
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
 
     # Loss and optimizer
-    criterion = nn.L1Loss()  # L1 loss for spectrogram generation
+    criterion = nn.L1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        print(f"\nResuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=config['device'])
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming from epoch {start_epoch}")
 
     # Training loop
     print("\nStarting training...")
-    for epoch in range(config['num_epochs']):
+    for epoch in range(start_epoch, config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
 
         train_loss = train_epoch(model, dataloader, optimizer, criterion, config['device'])
