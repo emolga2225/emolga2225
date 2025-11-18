@@ -64,18 +64,27 @@ class StemGenerationDataset(Dataset):
                 print(f"  Loading {name}.ogg...")
                 self.stems[name] = self._load_audio(self.data_dir / f'{name}.ogg')
 
-        # Calculate number of segments
-        self.n_segments = len(self.fullmix) // self.segment_samples
+        # Calculate number of segments (use length of first channel)
+        self.n_segments = self.fullmix.shape[1] // self.segment_samples
         print(f"Created {self.n_segments} segments from audio")
 
     def _load_audio(self, path):
-        """Load audio file"""
-        audio, sr = librosa.load(path, sr=self.sr, mono=True)
+        """Load audio file as stereo"""
+        audio, sr = librosa.load(path, sr=self.sr, mono=False)
+        # If mono, duplicate to stereo
+        if audio.ndim == 1:
+            audio = np.stack([audio, audio])
         return audio
 
     def _compute_spectrogram(self, audio):
-        """Compute magnitude spectrogram"""
-        stft = librosa.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length)
+        """Compute magnitude spectrogram from stereo audio"""
+        # Average left and right channels for spectrogram
+        if audio.ndim == 2:
+            audio_mono = np.mean(audio, axis=0)
+        else:
+            audio_mono = audio
+
+        stft = librosa.stft(audio_mono, n_fft=self.n_fft, hop_length=self.hop_length)
         magnitude = np.abs(stft)
         # Convert to log scale
         log_mag = np.log1p(magnitude)
@@ -89,10 +98,10 @@ class StemGenerationDataset(Dataset):
         start = idx * self.segment_samples
         end = start + self.segment_samples
 
-        # Extract audio segments
-        mix_segment = self.fullmix[start:end]
+        # Extract audio segments (handle stereo: [2, samples])
+        mix_segment = self.fullmix[:, start:end]
         stem_segments = {
-            name: audio[start:end]
+            name: audio[:, start:end]
             for name, audio in self.stems.items()
         }
 

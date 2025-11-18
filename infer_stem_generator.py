@@ -37,9 +37,12 @@ def generate_stems(model, audio_path, config, device='cuda', output_dir='generat
     """Generate stems from fullmix audio"""
     print(f"\nGenerating stems from {audio_path}...")
 
-    # Load audio
-    audio, sr = librosa.load(audio_path, sr=config['sample_rate'], mono=True)
-    print(f"Loaded audio: {len(audio)/sr:.2f} seconds")
+    # Load audio as stereo
+    audio, sr = librosa.load(audio_path, sr=config['sample_rate'], mono=False)
+    # If mono, duplicate to stereo
+    if audio.ndim == 1:
+        audio = np.stack([audio, audio])
+    print(f"Loaded audio: {audio.shape[1]/sr:.2f} seconds (stereo)")
 
     # Create output directory
     output_path = Path(output_dir)
@@ -47,9 +50,9 @@ def generate_stems(model, audio_path, config, device='cuda', output_dir='generat
 
     # Process in segments
     segment_samples = int(config['segment_length'] * config['sample_rate'])
-    n_segments = len(audio) // segment_samples
+    n_segments = audio.shape[1] // segment_samples
 
-    # Initialize arrays for accumulated stems
+    # Initialize arrays for accumulated stems (stereo)
     n_stems = len(config['stem_names'])
     stems_audio = {name: np.zeros_like(audio) for name in config['stem_names']}
 
@@ -60,54 +63,58 @@ def generate_stems(model, audio_path, config, device='cuda', output_dir='generat
             start = seg_idx * segment_samples
             end = start + segment_samples
 
-            # Extract segment
-            segment = audio[start:end]
+            # Extract segment (stereo: [2, samples])
+            segment = audio[:, start:end]
 
-            # Compute spectrogram
-            stft = librosa.stft(segment, n_fft=config['n_fft'], hop_length=config['hop_length'])
-            magnitude = np.abs(stft)
-            phase = np.angle(stft)  # Keep phase for reconstruction
-            log_mag = np.log1p(magnitude)
+            # Process each channel separately
+            for ch_idx in range(2):  # Process left and right channels
+                ch_segment = segment[ch_idx]
 
-            # Convert to tensor
-            mix_spec = torch.from_numpy(log_mag).float().unsqueeze(0).unsqueeze(0).to(device)
+                # Compute spectrogram for this channel
+                stft = librosa.stft(ch_segment, n_fft=config['n_fft'], hop_length=config['hop_length'])
+                magnitude = np.abs(stft)
+                phase = np.angle(stft)  # Keep phase for reconstruction
+                log_mag = np.log1p(magnitude)
 
-            # Generate stem spectrograms
-            generated_stems = model(mix_spec)  # [1, n_stems, freq, time]
-            generated_stems = generated_stems.squeeze(0).cpu().numpy()  # [n_stems, freq, time]
+                # Convert to tensor
+                mix_spec = torch.from_numpy(log_mag).float().unsqueeze(0).unsqueeze(0).to(device)
 
-            # Convert back from log scale
-            generated_stems = np.expm1(generated_stems)
+                # Generate stem spectrograms
+                generated_stems = model(mix_spec)  # [1, n_stems, freq, time]
+                generated_stems = generated_stems.squeeze(0).cpu().numpy()  # [n_stems, freq, time]
 
-            # Reconstruct audio for each stem using original phase
-            for stem_idx, stem_name in enumerate(config['stem_names']):
-                stem_mag = generated_stems[stem_idx]
+                # Convert back from log scale
+                generated_stems = np.expm1(generated_stems)
 
-                # Resize generated magnitude to match original phase dimensions
-                if stem_mag.shape != phase.shape:
-                    stem_mag_tensor = torch.from_numpy(stem_mag).unsqueeze(0).unsqueeze(0)
-                    stem_mag_tensor = torch.nn.functional.interpolate(
-                        stem_mag_tensor,
-                        size=phase.shape,
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    stem_mag = stem_mag_tensor.squeeze().numpy()
+                # Reconstruct audio for each stem using original phase
+                for stem_idx, stem_name in enumerate(config['stem_names']):
+                    stem_mag = generated_stems[stem_idx]
 
-                # Use original phase (this is a simplification - ideally estimate phase)
-                stem_stft = stem_mag * np.exp(1j * phase)
+                    # Resize generated magnitude to match original phase dimensions
+                    if stem_mag.shape != phase.shape:
+                        stem_mag_tensor = torch.from_numpy(stem_mag).unsqueeze(0).unsqueeze(0)
+                        stem_mag_tensor = torch.nn.functional.interpolate(
+                            stem_mag_tensor,
+                            size=phase.shape,
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        stem_mag = stem_mag_tensor.squeeze().numpy()
 
-                # Inverse STFT
-                stem_audio = librosa.istft(stem_stft, hop_length=config['hop_length'])
+                    # Use original phase (this is a simplification - ideally estimate phase)
+                    stem_stft = stem_mag * np.exp(1j * phase)
 
-                # Add to accumulated stem
-                stems_audio[stem_name][start:start+len(stem_audio)] += stem_audio
+                    # Inverse STFT
+                    stem_audio = librosa.istft(stem_stft, hop_length=config['hop_length'])
+
+                    # Add to accumulated stem (stereo: [2, samples])
+                    stems_audio[stem_name][ch_idx, start:start+len(stem_audio)] += stem_audio
 
             if (seg_idx + 1) % 10 == 0:
                 print(f"  Processed {seg_idx + 1}/{n_segments} segments")
 
     # Save stems
-    print(f"\nSaving stems to {output_path}...")
+    print(f"\nSaving stereo stems to {output_path}...")
     for stem_name, stem_audio in stems_audio.items():
         output_file = output_path / f'{stem_name}.wav'
 
@@ -116,8 +123,11 @@ def generate_stems(model, audio_path, config, device='cuda', output_dir='generat
         if max_val > 0:
             stem_audio = stem_audio / max_val * 0.95  # Prevent clipping
 
+        # Transpose to [samples, channels] for soundfile
+        stem_audio = stem_audio.T
+
         sf.write(output_file, stem_audio, config['sample_rate'])
-        print(f"  ✓ {stem_name}.wav")
+        print(f"  ✓ {stem_name}.wav (stereo)")
 
     print("\nStem generation complete!")
 
