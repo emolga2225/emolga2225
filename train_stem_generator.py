@@ -162,6 +162,29 @@ class UNetStemGenerator(nn.Module):
             nn.ReLU(inplace=True)
         )
 
+    def _match_size(self, x, target):
+        """Match x size to target size by center cropping or padding"""
+        _, _, h_x, w_x = x.shape
+        _, _, h_t, w_t = target.shape
+
+        # Crop or pad height
+        if h_x > h_t:
+            diff = h_x - h_t
+            x = x[:, :, diff//2:diff//2 + h_t, :]
+        elif h_x < h_t:
+            diff = h_t - h_x
+            x = torch.nn.functional.pad(x, (0, 0, diff//2, diff - diff//2))
+
+        # Crop or pad width
+        if w_x > w_t:
+            diff = w_x - w_t
+            x = x[:, :, :, diff//2:diff//2 + w_t]
+        elif w_x < w_t:
+            diff = w_t - w_x
+            x = torch.nn.functional.pad(x, (diff//2, diff - diff//2, 0, 0))
+
+        return x
+
     def forward(self, x):
         """
         Args:
@@ -179,18 +202,18 @@ class UNetStemGenerator(nn.Module):
         # Bottleneck
         bottleneck = self.bottleneck(self.pool(enc4))
 
-        # Decoder with skip connections
+        # Decoder with skip connections (match sizes before concatenating)
         dec4 = self.dec4(bottleneck)
-        dec4 = torch.cat([dec4, enc4], dim=1)  # Skip connection
+        dec4 = torch.cat([dec4, self._match_size(enc4, dec4)], dim=1)
 
         dec3 = self.dec3(dec4)
-        dec3 = torch.cat([dec3, enc3], dim=1)
+        dec3 = torch.cat([dec3, self._match_size(enc3, dec3)], dim=1)
 
         dec2 = self.dec2(dec3)
-        dec2 = torch.cat([dec2, enc2], dim=1)
+        dec2 = torch.cat([dec2, self._match_size(enc2, dec2)], dim=1)
 
         dec1 = self.dec1(dec2)
-        dec1 = torch.cat([dec1, enc1], dim=1)
+        dec1 = torch.cat([dec1, self._match_size(enc1, dec1)], dim=1)
 
         # Output layer
         output = self.output(dec1)
