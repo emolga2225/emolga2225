@@ -349,7 +349,7 @@ def main():
         'd_model': 128,
         'nhead': 8,
         'num_layers': 4,
-        'batch_size': 256,  # Increased from 64 for faster training
+        'batch_size': 1024,  # Massive batch size to saturate GPU
         'learning_rate': 1e-4,
         'weight_decay': 0.01,  # L2 regularization to prevent overfitting
         'label_smoothing': 0.1,  # Prevent overconfidence
@@ -382,10 +382,10 @@ def main():
         dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=4,  # Parallel data loading (each worker gets own HDF5 handle)
+        num_workers=8,  # More workers to feed massive batches
         pin_memory=True if config['device'] == 'cuda' else False,
         persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=2  # Prefetch batches to keep GPU busy
+        prefetch_factor=4  # Prefetch more batches for large batch size
     )
 
     # Create model
