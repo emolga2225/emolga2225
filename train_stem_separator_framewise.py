@@ -103,24 +103,21 @@ class FramewiseSinusoidalDataset(Dataset):
         f = self._get_h5_file()
         grp = f[f'c{window_info["channel"]}']
 
-        track_lens = grp['len'][:]
-        track_bands = grp['b'][:]
-
-        all_freqs = grp['f'][:]
-        all_amps = grp['a'][:]
-        all_phases = grp['p'][:]
+        # Read only what we need for offset calculation
+        track_lens = grp['len'][:window_info['track_idx']+1]
 
         # Find offset for this track
         offset = sum(track_lens[:window_info['track_idx']])
 
-        # Extract window data
+        # Calculate slice indices
         start = offset + window_info['start_frame']
         end = offset + window_info['end_frame']
 
-        freqs = all_freqs[start:end]
-        amps = all_amps[start:end]
-        phases = all_phases[start:end]
-        band = track_bands[window_info['track_idx']]
+        # Read ONLY the slice we need from HDF5 (not entire arrays!)
+        freqs = grp['f'][start:end]
+        amps = grp['a'][start:end]
+        phases = grp['p'][start:end]
+        band = grp['b'][window_info['track_idx']]
 
         # Apply data augmentation to prevent overfitting
         if self.augment:
