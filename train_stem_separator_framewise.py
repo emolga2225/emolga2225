@@ -379,10 +379,10 @@ def main():
         dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=6,  # Balance between throughput and HDF5 contention
+        num_workers=2,  # Fewer workers for faster startup with HDF5
         pin_memory=True if config['device'] == 'cuda' else False,
         persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=3  # Prefetch batches to keep GPU fed
+        prefetch_factor=2  # Prefetch batches to keep GPU fed
     )
 
     # Create model
