@@ -83,6 +83,17 @@ def generate_stems(model, audio_path, config, device='cuda', output_dir='generat
             for stem_idx, stem_name in enumerate(config['stem_names']):
                 stem_mag = generated_stems[stem_idx]
 
+                # Resize generated magnitude to match original phase dimensions
+                if stem_mag.shape != phase.shape:
+                    stem_mag_tensor = torch.from_numpy(stem_mag).unsqueeze(0).unsqueeze(0)
+                    stem_mag_tensor = torch.nn.functional.interpolate(
+                        stem_mag_tensor,
+                        size=phase.shape,
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    stem_mag = stem_mag_tensor.squeeze().numpy()
+
                 # Use original phase (this is a simplification - ideally estimate phase)
                 stem_stft = stem_mag * np.exp(1j * phase)
 
