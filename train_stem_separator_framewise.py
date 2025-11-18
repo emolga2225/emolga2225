@@ -257,12 +257,13 @@ class LabelSmoothingCrossEntropy(nn.Module):
         return torch.mean(torch.sum(-true_dist * pred, dim=-1))
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device):
-    """Train for one epoch"""
+def train_epoch(model, dataloader, optimizer, criterion, device, scaler=None):
+    """Train for one epoch with optional mixed precision"""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    use_amp = scaler is not None
 
     pbar = tqdm(dataloader, desc="Training")
     for batch in pbar:
@@ -273,28 +274,50 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
 
         optimizer.zero_grad()
 
-        # Forward pass
-        logits = model(features, mask, band)  # [batch, window_size, n_stems]
+        # Forward pass with automatic mixed precision
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                logits = model(features, mask, band)  # [batch, window_size, n_stems]
 
-        # Flatten for loss computation
-        logits_flat = logits.reshape(-1, logits.size(-1))  # [batch*window_size, n_stems]
-        labels_flat = labels.reshape(-1)  # [batch*window_size]
-        mask_flat = mask.reshape(-1)  # [batch*window_size]
+                # Flatten for loss computation
+                logits_flat = logits.reshape(-1, logits.size(-1))
+                labels_flat = labels.reshape(-1)
+                mask_flat = mask.reshape(-1)
 
-        # Filter to only valid frames
-        valid_mask = mask_flat > 0
-        if valid_mask.sum() == 0:
-            continue
+                # Filter to only valid frames
+                valid_mask = mask_flat > 0
+                if valid_mask.sum() == 0:
+                    continue
 
-        logits_valid = logits_flat[valid_mask]
-        labels_valid = labels_flat[valid_mask]
+                logits_valid = logits_flat[valid_mask]
+                labels_valid = labels_flat[valid_mask]
 
-        # Compute loss with label smoothing
-        loss = criterion(logits_valid, labels_valid)
+                # Compute loss with label smoothing
+                loss = criterion(logits_valid, labels_valid)
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard training without AMP
+            logits = model(features, mask, band)
+
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            labels_flat = labels.reshape(-1)
+            mask_flat = mask.reshape(-1)
+
+            valid_mask = mask_flat > 0
+            if valid_mask.sum() == 0:
+                continue
+
+            logits_valid = logits_flat[valid_mask]
+            labels_valid = labels_flat[valid_mask]
+
+            loss = criterion(logits_valid, labels_valid)
+
+            loss.backward()
+            optimizer.step()
 
         # Stats (only on valid frames)
         total_loss += loss.item()
@@ -318,13 +341,14 @@ def main():
         'd_model': 128,
         'nhead': 8,
         'num_layers': 4,
-        'batch_size': 64,
+        'batch_size': 256,  # Increased from 64 for faster training
         'learning_rate': 1e-4,
         'weight_decay': 0.01,  # L2 regularization to prevent overfitting
         'label_smoothing': 0.1,  # Prevent overconfidence
         'num_epochs': 100,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'augment': True  # Enable data augmentation
+        'augment': True,  # Enable data augmentation
+        'use_amp': True  # Mixed precision training for 2-3x speedup
     }
 
     print("Frame-wise Stem Separator Training")
@@ -368,6 +392,9 @@ def main():
     print(f"Total parameters: {total_params:,}")
 
     # Loss with label smoothing to prevent overconfidence
+    print(f"\nOptimization settings:")
+    print(f"  Batch size: {config['batch_size']}")
+    print(f"  Mixed precision (AMP): {'enabled' if config.get('use_amp', False) else 'disabled'}")
     print(f"\nRegularization settings:")
     print(f"  Label smoothing: {config['label_smoothing']}")
     print(f"  Weight decay: {config['weight_decay']}")
@@ -382,12 +409,15 @@ def main():
         weight_decay=config['weight_decay']
     )
 
+    # Mixed precision training scaler
+    scaler = torch.cuda.amp.GradScaler() if config.get('use_amp', False) and config['device'] == 'cuda' else None
+
     # Training loop
     print("\nStarting training...")
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
 
-        train_loss, train_acc = train_epoch(model, dataloader, optimizer, criterion, config['device'])
+        train_loss, train_acc = train_epoch(model, dataloader, optimizer, criterion, config['device'], scaler)
 
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
 
