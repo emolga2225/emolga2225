@@ -355,7 +355,7 @@ def main():
         'label_smoothing': 0.1,  # Prevent overconfidence
         'num_epochs': 100,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'augment': True,  # Enable data augmentation
+        'augment': True,  # Enable data augmentation to prevent overfitting
         'use_amp': True  # Mixed precision training for 2-3x speedup
     }
 
