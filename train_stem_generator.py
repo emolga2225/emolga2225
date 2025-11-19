@@ -364,7 +364,7 @@ def main():
         dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=2,
+        num_workers=0,  # Single-threaded to avoid deadlock with audio loading
         pin_memory=True if config['device'] == 'cuda' else False
     )
 
