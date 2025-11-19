@@ -22,7 +22,7 @@ class StemGenerationDataset(Dataset):
     """Dataset that loads fullmix + stem audio from multiple songs"""
 
     def __init__(self, data_dirs, stem_names, sample_rate=44100, n_fft=2048,
-                 hop_length=512, segment_length=4.0):
+                 hop_length=512, segment_length=4.0, augment=True):
         """
         Args:
             data_dirs: List of directories, each containing fullmix.ogg and stem .ogg files
@@ -31,6 +31,7 @@ class StemGenerationDataset(Dataset):
             n_fft: FFT size for spectrogram
             hop_length: Hop length for STFT
             segment_length: Length of audio segments in seconds
+            augment: Whether to apply data augmentation to prevent overfitting
         """
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
@@ -41,6 +42,7 @@ class StemGenerationDataset(Dataset):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.segment_samples = int(segment_length * sample_rate)
+        self.augment = augment
 
         # Load audio from all songs
         print(f"Loading audio files from {len(self.data_dirs)} song(s)...")
