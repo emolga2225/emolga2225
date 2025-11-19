@@ -15,6 +15,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import librosa
+import h5py
 from pathlib import Path
 from tqdm import tqdm
 
@@ -53,6 +54,9 @@ class StemGenerationDataset(Dataset):
             fullmix = self._load_audio(data_dir / 'fullmix.ogg')
             stems = {}
 
+            # Load sinusoidal data for each stem (the "reverse engineered" data)
+            sinusoidal_specs = {}
+
             for name in stem_names:
                 if name == 'drums':
                     # Drums are split into 4 files - combine them
@@ -83,12 +87,18 @@ class StemGenerationDataset(Dataset):
                     if stem_path.exists():
                         stems[name] = self._load_audio(stem_path)
 
+                # Load sinusoidal .h5 data for this stem
+                h5_path = data_dir / f'{name}.h5'
+                if h5_path.exists():
+                    sinusoidal_specs[name] = self._load_sinusoidal_h5(h5_path, fullmix.shape[1])
+
             # Calculate segments for this song
             n_segments = fullmix.shape[1] // self.segment_samples
 
             self.songs.append({
                 'fullmix': fullmix,
                 'stems': stems,
+                'sinusoidal_specs': sinusoidal_specs,
                 'n_segments': n_segments,
                 'dir': data_dir
             })
@@ -106,6 +116,60 @@ class StemGenerationDataset(Dataset):
         if audio.ndim == 1:
             audio = np.stack([audio, audio])
         return audio
+
+    def _load_sinusoidal_h5(self, h5_path, audio_length):
+        """Load sinusoidal tracks from .h5 and convert to spectrogram
+
+        This provides the 'reverse engineered' precise frequency data
+        that makes training more detailed than Spleeter.
+        """
+        # Calculate expected spectrogram dimensions
+        n_frames = 1 + (audio_length // self.hop_length)
+        n_bins = 1 + (self.n_fft // 2)
+
+        # Initialize spectrogram (average both channels)
+        spec = np.zeros((n_bins, n_frames), dtype=np.float32)
+
+        with h5py.File(h5_path, 'r') as f:
+            # Process all channels and average them
+            n_channels = f.attrs.get('ch', 1)
+
+            for ch_idx in range(n_channels):
+                grp_name = f'c{ch_idx}'
+                if grp_name not in f:
+                    continue
+
+                grp = f[grp_name]
+
+                # Load track data
+                track_lens = grp['len'][:]
+                frequencies = grp['f'][:]
+                amplitudes = grp['a'][:]
+                frame_indices = grp['i'][:]
+
+                # Reconstruct spectrogram from sinusoidal tracks
+                offset = 0
+                for track_len in track_lens:
+                    track_freqs = frequencies[offset:offset + track_len]
+                    track_amps = amplitudes[offset:offset + track_len]
+                    track_frames = frame_indices[offset:offset + track_len]
+
+                    # Add each sinusoid to the spectrogram
+                    for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
+                        if 0 <= frame < n_frames:
+                            # Convert frequency to bin index
+                            bin_idx = int(freq * self.n_fft / self.sr)
+                            if 0 <= bin_idx < n_bins:
+                                spec[bin_idx, frame] += amp
+
+                    offset += track_len
+
+            # Average across channels
+            spec = spec / max(n_channels, 1)
+
+        # Convert to log scale like audio spectrograms
+        log_spec = np.log1p(spec)
+        return log_spec
 
     def _compute_spectrogram(self, audio):
         """Compute magnitude spectrogram from stereo audio"""
@@ -141,6 +205,14 @@ class StemGenerationDataset(Dataset):
                     name: audio[:, start:end]
                     for name, audio in song['stems'].items()
                 }
+
+                # Extract corresponding sinusoidal spectrogram segments
+                start_frame = start // self.hop_length
+                end_frame = end // self.hop_length
+                sinusoidal_segments = {
+                    name: spec[:, start_frame:end_frame]
+                    for name, spec in song['sinusoidal_specs'].items()
+                }
                 break
             cumulative += song['n_segments']
         else:
@@ -158,9 +230,16 @@ class StemGenerationDataset(Dataset):
             stem_specs[name] for name in self.stem_names
         ], axis=0)
 
+        # Stack sinusoidal spectrograms (the "reverse engineered" precise data)
+        sinusoidal_specs_array = np.stack([
+            sinusoidal_segments.get(name, np.zeros_like(mix_spec))
+            for name in self.stem_names
+        ], axis=0)
+
         return {
             'mix_spec': torch.from_numpy(mix_spec).float().unsqueeze(0),  # [1, freq, time]
             'stem_specs': torch.from_numpy(stem_specs_array).float(),  # [n_stems, freq, time]
+            'sinusoidal_specs': torch.from_numpy(sinusoidal_specs_array).float(),  # [n_stems, freq, time]
         }
 
 
@@ -289,6 +368,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     for batch in pbar:
         mix_spec = batch['mix_spec'].to(device)
         stem_specs = batch['stem_specs'].to(device)
+        sinusoidal_specs = batch['sinusoidal_specs'].to(device)
 
         optimizer.zero_grad()
 
@@ -304,15 +384,23 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
                 align_corners=False
             )
 
-        # Loss: L1 distance between generated and ground truth stem spectrograms
-        loss = criterion(generated_stems, stem_specs)
+        # Multi-objective loss:
+        # 1. Primary: Match audio spectrograms (what it should sound like)
+        audio_loss = criterion(generated_stems, stem_specs)
+
+        # 2. Auxiliary: Match sinusoidal spectrograms (precise frequency detail)
+        #    This is the "reverse engineered" data that makes it better than Spleeter
+        sinusoidal_loss = criterion(generated_stems, sinusoidal_specs)
+
+        # Combined loss (weight sinusoidal loss lower since it's auxiliary guidance)
+        loss = audio_loss + 0.3 * sinusoidal_loss
 
         # Backward pass
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'audio': f'{audio_loss.item():.4f}', 'sin': f'{sinusoidal_loss.item():.4f}'})
 
     return total_loss / len(dataloader)
 
