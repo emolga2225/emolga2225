@@ -54,8 +54,9 @@ class StemGenerationDataset(Dataset):
             fullmix = self._load_audio(data_dir / 'fullmix.ogg')
             stems = {}
 
-            # Load sinusoidal data for each stem (the "reverse engineered" data)
-            sinusoidal_specs = {}
+            # Store paths to sinusoidal .h5 files (lazy loading for memory efficiency)
+            # .h5 files are 200MB-1.2GB each, so we can't load them all upfront
+            h5_paths = {}
 
             for name in stem_names:
                 if name == 'drums':
@@ -87,10 +88,10 @@ class StemGenerationDataset(Dataset):
                     if stem_path.exists():
                         stems[name] = self._load_audio(stem_path)
 
-                # Load sinusoidal .h5 data for this stem
+                # Store .h5 file path for lazy loading
                 h5_path = data_dir / f'{name}.h5'
                 if h5_path.exists():
-                    sinusoidal_specs[name] = self._load_sinusoidal_h5(h5_path, fullmix.shape[1])
+                    h5_paths[name] = h5_path
 
             # Calculate segments for this song
             n_segments = fullmix.shape[1] // self.segment_samples
@@ -98,7 +99,7 @@ class StemGenerationDataset(Dataset):
             self.songs.append({
                 'fullmix': fullmix,
                 'stems': stems,
-                'sinusoidal_specs': sinusoidal_specs,
+                'h5_paths': h5_paths,
                 'n_segments': n_segments,
                 'dir': data_dir
             })
@@ -117,17 +118,22 @@ class StemGenerationDataset(Dataset):
             audio = np.stack([audio, audio])
         return audio
 
-    def _load_sinusoidal_h5(self, h5_path, audio_length):
-        """Load sinusoidal tracks from .h5 and convert to spectrogram
+    def _load_sinusoidal_segment_h5(self, h5_path, start_sample, end_sample):
+        """Load only a specific time segment from sinusoidal .h5 file
 
         This provides the 'reverse engineered' precise frequency data
         that makes training more detailed than Spleeter.
+
+        Uses lazy loading - only reads the sinusoidal tracks that overlap
+        with the requested time range instead of loading the entire file.
         """
-        # Calculate expected spectrogram dimensions
-        n_frames = 1 + (audio_length // self.hop_length)
+        # Calculate frame range for this segment
+        start_frame = start_sample // self.hop_length
+        end_frame = end_sample // self.hop_length
+        n_frames = end_frame - start_frame
         n_bins = 1 + (self.n_fft // 2)
 
-        # Initialize spectrogram (average both channels)
+        # Initialize spectrogram for this segment only
         spec = np.zeros((n_bins, n_frames), dtype=np.float32)
 
         with h5py.File(h5_path, 'r') as f:
@@ -141,31 +147,43 @@ class StemGenerationDataset(Dataset):
 
                 grp = f[grp_name]
 
-                # Load track data
+                # Load track metadata to find tracks in this time range
                 track_lens = grp['len'][:]
+                track_starts = grp['s'][:]
+                track_ends = grp['e'][:]
+
+                # Load full data arrays (still need these to index properly)
                 frequencies = grp['f'][:]
                 amplitudes = grp['a'][:]
                 frame_indices = grp['i'][:]
 
-                # Reconstruct spectrogram from sinusoidal tracks
+                # Process only tracks that overlap with our segment
                 offset = 0
-                for track_len in track_lens:
-                    track_freqs = frequencies[offset:offset + track_len]
-                    track_amps = amplitudes[offset:offset + track_len]
-                    track_frames = frame_indices[offset:offset + track_len]
+                for track_idx, track_len in enumerate(track_lens):
+                    track_start = track_starts[track_idx]
+                    track_end = track_ends[track_idx]
 
-                    # Add each sinusoid to the spectrogram
-                    for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
-                        if 0 <= frame < n_frames:
-                            # Convert frequency to bin index
-                            bin_idx = int(freq * self.n_fft / self.sr)
-                            if 0 <= bin_idx < n_bins:
-                                spec[bin_idx, frame] += amp
+                    # Check if this track overlaps with our segment
+                    if track_end >= start_frame and track_start < end_frame:
+                        track_freqs = frequencies[offset:offset + track_len]
+                        track_amps = amplitudes[offset:offset + track_len]
+                        track_frames = frame_indices[offset:offset + track_len]
+
+                        # Add sinusoids that fall within our segment
+                        for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
+                            if start_frame <= frame < end_frame:
+                                # Convert to local frame index (relative to segment start)
+                                local_frame = frame - start_frame
+                                # Convert frequency to bin index
+                                bin_idx = int(freq * self.n_fft / self.sr)
+                                if 0 <= bin_idx < n_bins and 0 <= local_frame < n_frames:
+                                    spec[bin_idx, local_frame] += amp
 
                     offset += track_len
 
             # Average across channels
-            spec = spec / max(n_channels, 1)
+            if n_channels > 0:
+                spec = spec / n_channels
 
         # Convert to log scale like audio spectrograms
         log_spec = np.log1p(spec)
@@ -206,13 +224,13 @@ class StemGenerationDataset(Dataset):
                     for name, audio in song['stems'].items()
                 }
 
-                # Extract corresponding sinusoidal spectrogram segments
-                start_frame = start // self.hop_length
-                end_frame = end // self.hop_length
-                sinusoidal_segments = {
-                    name: spec[:, start_frame:end_frame]
-                    for name, spec in song['sinusoidal_specs'].items()
-                }
+                # Lazy load sinusoidal spectrograms for this segment only
+                # (avoids loading 200MB-1.2GB .h5 files all at once)
+                sinusoidal_segments = {}
+                for name, h5_path in song['h5_paths'].items():
+                    sinusoidal_segments[name] = self._load_sinusoidal_segment_h5(
+                        h5_path, start, end
+                    )
                 break
             cumulative += song['n_segments']
         else:
