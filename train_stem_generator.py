@@ -68,6 +68,14 @@ class StemGenerationDataset(Dataset):
 
                     if drums_combined is not None:
                         stems[name] = drums_combined
+                elif name == 'bass':
+                    # Check for both bass.ogg and rhythm.ogg
+                    bass_path = data_dir / 'bass.ogg'
+                    rhythm_path = data_dir / 'rhythm.ogg'
+                    if bass_path.exists():
+                        stems[name] = self._load_audio(bass_path)
+                    elif rhythm_path.exists():
+                        stems[name] = self._load_audio(rhythm_path)
                 else:
                     stem_path = data_dir / f'{name}.ogg'
                     if stem_path.exists():
