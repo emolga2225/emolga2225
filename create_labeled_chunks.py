@@ -83,8 +83,19 @@ def load_all_h5_data(data_dir, stem_names):
                     'frame_indices': np.concatenate(drum_frames),
                 }
         else:
-            stem_h5 = data_dir / f'{stem_name}_tracks.h5'
-            if stem_h5.exists():
+            # Try primary name first, then alternatives
+            alternatives = [stem_name]
+            if stem_name == 'bass':
+                alternatives.append('rhythm')  # Some songs use rhythm instead of bass
+
+            stem_h5 = None
+            for alt_name in alternatives:
+                alt_path = data_dir / f'{alt_name}_tracks.h5'
+                if alt_path.exists():
+                    stem_h5 = alt_path
+                    break
+
+            if stem_h5 is not None:
                 with h5py.File(stem_h5, 'r') as f:
                     n_channels = f.attrs.get('ch', 1)
 
