@@ -123,6 +123,17 @@ class StemGenerationDataset(Dataset):
         self.total_segments = sum(song['n_segments'] for song in self.songs)
         print(f"\nTotal segments across all songs: {self.total_segments}")
 
+        # Cache for open .h5 files (per worker process)
+        # Keeps files open to avoid repeated open/close overhead
+        self._h5_cache = {}
+
+    def _get_h5_file(self, h5_path):
+        """Get or open an .h5 file and cache it to avoid repeated open/close"""
+        h5_path_str = str(h5_path)
+        if h5_path_str not in self._h5_cache:
+            self._h5_cache[h5_path_str] = h5py.File(h5_path, 'r')
+        return self._h5_cache[h5_path_str]
+
     def _load_audio(self, path):
         """Load audio file as stereo"""
         audio, sr = librosa.load(path, sr=self.sr, mono=False)
@@ -149,54 +160,56 @@ class StemGenerationDataset(Dataset):
         # Initialize spectrogram for this segment only
         spec = np.zeros((n_bins, n_frames), dtype=np.float32)
 
-        with h5py.File(h5_path, 'r') as f:
-            # Process all channels and average them
-            n_channels = f.attrs.get('ch', 1)
+        # Use cached .h5 file (keeps file open instead of repeated open/close)
+        f = self._get_h5_file(h5_path)
 
-            for ch_idx in range(n_channels):
-                grp_name = f'c{ch_idx}'
-                if grp_name not in f:
-                    continue
+        # Process all channels and average them
+        n_channels = f.attrs.get('ch', 1)
 
-                grp = f[grp_name]
+        for ch_idx in range(n_channels):
+            grp_name = f'c{ch_idx}'
+            if grp_name not in f:
+                continue
 
-                # Load track metadata to find tracks in this time range
-                track_lens = grp['len'][:]
-                track_starts = grp['s'][:]
-                track_ends = grp['e'][:]
+            grp = f[grp_name]
 
-                # Load full data arrays (still need these to index properly)
-                frequencies = grp['f'][:]
-                amplitudes = grp['a'][:]
-                frame_indices = grp['i'][:]
+            # Load track metadata to find tracks in this time range
+            track_lens = grp['len'][:]
+            track_starts = grp['s'][:]
+            track_ends = grp['e'][:]
 
-                # Process only tracks that overlap with our segment
-                offset = 0
-                for track_idx, track_len in enumerate(track_lens):
-                    track_start = track_starts[track_idx]
-                    track_end = track_ends[track_idx]
+            # Load full data arrays (still need these to index properly)
+            frequencies = grp['f'][:]
+            amplitudes = grp['a'][:]
+            frame_indices = grp['i'][:]
 
-                    # Check if this track overlaps with our segment
-                    if track_end >= start_frame and track_start < end_frame:
-                        track_freqs = frequencies[offset:offset + track_len]
-                        track_amps = amplitudes[offset:offset + track_len]
-                        track_frames = frame_indices[offset:offset + track_len]
+            # Process only tracks that overlap with our segment
+            offset = 0
+            for track_idx, track_len in enumerate(track_lens):
+                track_start = track_starts[track_idx]
+                track_end = track_ends[track_idx]
 
-                        # Add sinusoids that fall within our segment
-                        for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
-                            if start_frame <= frame < end_frame:
-                                # Convert to local frame index (relative to segment start)
-                                local_frame = frame - start_frame
-                                # Convert frequency to bin index
-                                bin_idx = int(freq * self.n_fft / self.sr)
-                                if 0 <= bin_idx < n_bins and 0 <= local_frame < n_frames:
-                                    spec[bin_idx, local_frame] += amp
+                # Check if this track overlaps with our segment
+                if track_end >= start_frame and track_start < end_frame:
+                    track_freqs = frequencies[offset:offset + track_len]
+                    track_amps = amplitudes[offset:offset + track_len]
+                    track_frames = frame_indices[offset:offset + track_len]
 
-                    offset += track_len
+                    # Add sinusoids that fall within our segment
+                    for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
+                        if start_frame <= frame < end_frame:
+                            # Convert to local frame index (relative to segment start)
+                            local_frame = frame - start_frame
+                            # Convert frequency to bin index
+                            bin_idx = int(freq * self.n_fft / self.sr)
+                            if 0 <= bin_idx < n_bins and 0 <= local_frame < n_frames:
+                                spec[bin_idx, local_frame] += amp
 
-            # Average across channels
-            if n_channels > 0:
-                spec = spec / n_channels
+                offset += track_len
+
+        # Average across channels
+        if n_channels > 0:
+            spec = spec / n_channels
 
         # Convert to log scale like audio spectrograms
         log_spec = np.log1p(spec)
