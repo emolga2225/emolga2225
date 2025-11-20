@@ -71,8 +71,14 @@ class H5AudioDataset(Dataset):
                     ogg_path = data_dir / f'{stem_name}.ogg'
                     ogg_paths = [ogg_path] if ogg_path.exists() else []
 
-                if not h5_path.exists() or not ogg_paths:
+                if not h5_path.exists():
+                    print(f"    Skipping {stem_name}: {h5_path} not found")
                     continue
+                if not ogg_paths:
+                    print(f"    Skipping {stem_name}: .ogg files not found")
+                    continue
+
+                print(f"    Found {stem_name}: {h5_path.name} + {len(ogg_paths)} .ogg file(s)")
 
                 # Load clean audio
                 clean_audio = None
@@ -85,6 +91,7 @@ class H5AudioDataset(Dataset):
 
                 # Calculate number of segments
                 n_segments = len(clean_audio) // self.segment_samples
+                print(f"      Audio length: {len(clean_audio)/self.sr:.2f}s → {n_segments} segments")
 
                 # Store segment info
                 for seg_idx in range(n_segments):
@@ -95,7 +102,7 @@ class H5AudioDataset(Dataset):
                         'stem_name': stem_name
                     })
 
-            print(f"    Loaded {len(self.segments)} total segments")
+        print(f"\n  Total segments loaded: {len(self.segments)}")
 
         self.total_segments = len(self.segments)
         print(f"\nTotal segments: {self.total_segments}")
