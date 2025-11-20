@@ -199,8 +199,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train stem separator on sinusoidal chunks')
     parser.add_argument('--data-dirs', nargs='+', required=True, help='Song directories')
     parser.add_argument('--stem-names', nargs='+', default=['vocals', 'guitar', 'bass', 'drums'])
-    parser.add_argument('--max-sinusoids', type=int, default=10000, help='Max sinusoids per chunk')
-    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--max-sinusoids', type=int, default=2000, help='Max sinusoids per chunk')
+    parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -237,9 +237,9 @@ def main():
     # Create model
     model = TransformerStemSeparator(
         n_stems=len(args.stem_names),
-        d_model=256,
-        nhead=8,
-        num_layers=6,
+        d_model=128,
+        nhead=4,
+        num_layers=4,
         max_sinusoids=args.max_sinusoids
     ).to(args.device)
 
