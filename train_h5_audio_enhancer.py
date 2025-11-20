@@ -56,51 +56,34 @@ class H5AudioDataset(Dataset):
             print(f"\n  Processing {data_dir.name}...")
 
             for stem_name in stem_names:
-                h5_path = data_dir / f'{stem_name}.h5'
-
-                # Handle different .ogg naming conventions
+                # Handle different .h5 naming conventions
                 if stem_name == 'drums':
-                    # Combine drum files
+                    # Drums are split into multiple files
+                    h5_paths_list = [data_dir / f'drums_{i}_tracks.h5' for i in range(1, 5)]
+                    h5_paths_list = [p for p in h5_paths_list if p.exists()]
+                    # Combine drum .ogg files
                     ogg_paths = [data_dir / f'drums_{i}.ogg' for i in range(1, 5)]
                     ogg_paths = [p for p in ogg_paths if p.exists()]
+                    # For drums, process each .h5 file separately
+                    for drum_idx, h5_path in enumerate(h5_paths_list, 1):
+                        drum_ogg = data_dir / f'drums_{drum_idx}.ogg'
+                        if h5_path.exists() and drum_ogg.exists():
+                            self._load_stem_data(h5_path, [drum_ogg], f'drums_{drum_idx}')
+                    continue  # Skip the general processing below for drums
+
                 elif stem_name == 'bass':
-                    bass_path = data_dir / 'bass.ogg'
-                    rhythm_path = data_dir / 'rhythm.ogg'
-                    ogg_paths = [bass_path] if bass_path.exists() else ([rhythm_path] if rhythm_path.exists() else [])
+                    h5_path = data_dir / 'bass_tracks.h5'
+                    bass_ogg = data_dir / 'bass.ogg'
+                    rhythm_ogg = data_dir / 'rhythm.ogg'
+                    ogg_paths = [bass_ogg] if bass_ogg.exists() else ([rhythm_ogg] if rhythm_ogg.exists() else [])
                 else:
+                    h5_path = data_dir / f'{stem_name}_tracks.h5'
                     ogg_path = data_dir / f'{stem_name}.ogg'
                     ogg_paths = [ogg_path] if ogg_path.exists() else []
 
-                if not h5_path.exists():
-                    print(f"    Skipping {stem_name}: {h5_path} not found")
-                    continue
-                if not ogg_paths:
-                    print(f"    Skipping {stem_name}: .ogg files not found")
-                    continue
-
-                print(f"    Found {stem_name}: {h5_path.name} + {len(ogg_paths)} .ogg file(s)")
-
-                # Load clean audio
-                clean_audio = None
-                for ogg_path in ogg_paths:
-                    audio, sr = librosa.load(ogg_path, sr=self.sr, mono=True)
-                    if clean_audio is None:
-                        clean_audio = audio
-                    else:
-                        clean_audio = clean_audio + audio
-
-                # Calculate number of segments
-                n_segments = len(clean_audio) // self.segment_samples
-                print(f"      Audio length: {len(clean_audio)/self.sr:.2f}s → {n_segments} segments")
-
-                # Store segment info
-                for seg_idx in range(n_segments):
-                    self.segments.append({
-                        'h5_path': h5_path,
-                        'clean_audio': clean_audio,
-                        'segment_idx': seg_idx,
-                        'stem_name': stem_name
-                    })
+                # Process non-drum stems
+                if h5_path.exists() and ogg_paths:
+                    self._load_stem_data(h5_path, ogg_paths, stem_name)
 
         print(f"\n  Total segments loaded: {len(self.segments)}")
 
@@ -109,6 +92,32 @@ class H5AudioDataset(Dataset):
 
         # Cache for synthesized audio (per .h5 file)
         self._synth_cache = {}
+
+    def _load_stem_data(self, h5_path, ogg_paths, stem_name):
+        """Load and segment a single stem's .h5 and .ogg data"""
+        print(f"    Found {stem_name}: {h5_path.name} + {len(ogg_paths)} .ogg file(s)")
+
+        # Load clean audio
+        clean_audio = None
+        for ogg_path in ogg_paths:
+            audio, sr = librosa.load(ogg_path, sr=self.sr, mono=True)
+            if clean_audio is None:
+                clean_audio = audio
+            else:
+                clean_audio = clean_audio + audio
+
+        # Calculate number of segments
+        n_segments = len(clean_audio) // self.segment_samples
+        print(f"      Audio length: {len(clean_audio)/self.sr:.2f}s → {n_segments} segments")
+
+        # Store segment info
+        for seg_idx in range(n_segments):
+            self.segments.append({
+                'h5_path': h5_path,
+                'clean_audio': clean_audio,
+                'segment_idx': seg_idx,
+                'stem_name': stem_name
+            })
 
     def _synthesize_h5(self, h5_path):
         """Synthesize audio from .h5 file and cache it"""
