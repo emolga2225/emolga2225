@@ -59,10 +59,13 @@ class StemGenerationDataset(Dataset):
         for data_dir in self.data_dirs:
             print(f"\n  Loading from {data_dir.name}...")
 
-            # Check if fullmix.h5 exists for ultra-precise synchrosqueeze data
-            fullmix_h5_path = data_dir / 'fullmix.h5'
+            # Check if fullmix .h5 exists for ultra-precise synchrosqueeze data
+            # Try fullmix_tracks.h5 first, then fallback to fullmix.h5
+            fullmix_h5_path = data_dir / 'fullmix_tracks.h5'
             if not fullmix_h5_path.exists():
-                fullmix_h5_path = None  # Will use fullmix.ogg spectrogram as fallback
+                fullmix_h5_path = data_dir / 'fullmix.h5'
+                if not fullmix_h5_path.exists():
+                    fullmix_h5_path = None  # Will use fullmix.ogg spectrogram as fallback
 
             # Load fullmix audio (used for length calculation and as fallback input)
             fullmix = self._load_audio(data_dir / 'fullmix.ogg')
