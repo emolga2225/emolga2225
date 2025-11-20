@@ -17,151 +17,69 @@ import argparse
 
 
 class SinusoidChunkDataset(Dataset):
-    """Dataset that loads chunked sinusoidal data"""
+    """Dataset that loads pre-labeled chunked sinusoidal data"""
 
     def __init__(self, data_dirs, stem_names=['vocals', 'guitar', 'bass', 'drums'], max_sinusoids=10000):
         self.stem_names = stem_names
         self.max_sinusoids = max_sinusoids
-        self.chunks = []
+        self.chunk_paths = []
 
-        print("Loading chunked data...")
+        print("Loading labeled chunks...")
         for data_dir in data_dirs:
             data_dir = Path(data_dir)
-            chunks_dir = data_dir / 'chunks'
+            chunks_dir = data_dir / 'labeled_chunks'
 
             if not chunks_dir.exists():
-                print(f"  Skipping {data_dir.name}: no chunks/ directory")
+                print(f"  Skipping {data_dir.name}: no labeled_chunks/ directory")
                 continue
 
-            print(f"  Loading {data_dir.name}...")
+            # Find all chunk files
+            chunk_files = sorted(chunks_dir.glob('chunk_*.npz'))
+            print(f"  {data_dir.name}: {len(chunk_files)} chunks")
 
-            # Find all fullmix chunks
-            fullmix_chunks = sorted(chunks_dir.glob('fullmix_chunk_*.npz'))
+            self.chunk_paths.extend(chunk_files)
 
-            for fullmix_path in fullmix_chunks:
-                chunk_idx = fullmix_path.stem.split('_')[-1]
-
-                # Load corresponding stem chunks
-                stem_chunks = {}
-                all_found = True
-
-                for stem_name in stem_names:
-                    if stem_name == 'drums':
-                        # Combine all drum chunks
-                        drum_sinusoids = []
-                        for i in range(1, 5):
-                            drum_path = chunks_dir / f'drums_{i}_chunk_{chunk_idx}.npz'
-                            if drum_path.exists():
-                                drum_data = np.load(drum_path)
-                                drum_sinusoids.append({
-                                    'frequencies': drum_data['frequencies'],
-                                    'amplitudes': drum_data['amplitudes'],
-                                    'phases': drum_data['phases'],
-                                    'frame_indices': drum_data['frame_indices']
-                                })
-
-                        if len(drum_sinusoids) == 0:
-                            all_found = False
-                            break
-
-                        # Combine all drum sinusoids
-                        stem_chunks['drums'] = {
-                            'frequencies': np.concatenate([d['frequencies'] for d in drum_sinusoids]),
-                            'amplitudes': np.concatenate([d['amplitudes'] for d in drum_sinusoids]),
-                            'phases': np.concatenate([d['phases'] for d in drum_sinusoids]),
-                            'frame_indices': np.concatenate([d['frame_indices'] for d in drum_sinusoids])
-                        }
-                    else:
-                        stem_path = chunks_dir / f'{stem_name}_chunk_{chunk_idx}.npz'
-                        if not stem_path.exists():
-                            all_found = False
-                            break
-
-                        stem_data = np.load(stem_path)
-                        stem_chunks[stem_name] = {
-                            'frequencies': stem_data['frequencies'],
-                            'amplitudes': stem_data['amplitudes'],
-                            'phases': stem_data['phases'],
-                            'frame_indices': stem_data['frame_indices']
-                        }
-
-                if not all_found:
-                    continue
-
-                # Load fullmix
-                fullmix_data = np.load(fullmix_path)
-
-                self.chunks.append({
-                    'fullmix': {
-                        'frequencies': fullmix_data['frequencies'],
-                        'amplitudes': fullmix_data['amplitudes'],
-                        'phases': fullmix_data['phases'],
-                        'frame_indices': fullmix_data['frame_indices']
-                    },
-                    'stems': stem_chunks,
-                    'song': data_dir.name
-                })
-
-        print(f"Total chunks loaded: {len(self.chunks)}")
+        print(f"Total chunks loaded: {len(self.chunk_paths)}")
 
     def __len__(self):
-        return len(self.chunks)
+        return len(self.chunk_paths)
 
     def __getitem__(self, idx):
         """Get a training chunk"""
-        chunk = self.chunks[idx]
+        # Load chunk (pre-labeled during preprocessing)
+        chunk_data = np.load(self.chunk_paths[idx])
 
-        # Get fullmix sinusoids
-        fullmix = chunk['fullmix']
-        n_fullmix = len(fullmix['frequencies'])
+        frequencies = chunk_data['frequencies']
+        amplitudes = chunk_data['amplitudes']
+        phases = chunk_data['phases']
+        frame_indices = chunk_data['frame_indices']
+        labels = chunk_data['labels']  # Pre-assigned stem labels!
+
+        n_sinusoids = len(frequencies)
 
         # Pad or truncate to max_sinusoids
-        if n_fullmix > self.max_sinusoids:
+        if n_sinusoids > self.max_sinusoids:
             # Randomly sample
-            indices = np.random.choice(n_fullmix, self.max_sinusoids, replace=False)
+            indices = np.random.choice(n_sinusoids, self.max_sinusoids, replace=False)
+            n_valid = self.max_sinusoids
         else:
-            # Pad with zeros
-            indices = np.arange(n_fullmix)
+            indices = np.arange(n_sinusoids)
+            n_valid = n_sinusoids
 
         # Create input features [max_sinusoids, 4] (freq, amp, phase, frame)
         input_features = np.zeros((self.max_sinusoids, 4), dtype=np.float32)
-        input_features[:len(indices), 0] = fullmix['frequencies'][indices]
-        input_features[:len(indices), 1] = fullmix['amplitudes'][indices]
-        input_features[:len(indices), 2] = fullmix['phases'][indices]
-        input_features[:len(indices), 3] = fullmix['frame_indices'][indices]
+        input_features[:n_valid, 0] = frequencies[indices]
+        input_features[:n_valid, 1] = amplitudes[indices]
+        input_features[:n_valid, 2] = phases[indices]
+        input_features[:n_valid, 3] = frame_indices[indices]
 
         # Create mask for valid sinusoids
         mask = np.zeros(self.max_sinusoids, dtype=np.float32)
-        mask[:len(indices)] = 1.0
+        mask[:n_valid] = 1.0
 
-        # Create targets: for each fullmix sinusoid, which stem does it belong to?
-        # We'll match based on nearest frequency/frame
+        # Labels (pre-computed during preprocessing)
         stem_labels = np.zeros(self.max_sinusoids, dtype=np.int64)
-
-        for i, fullmix_idx in enumerate(indices):
-            fullmix_freq = fullmix['frequencies'][fullmix_idx]
-            fullmix_frame = fullmix['frame_indices'][fullmix_idx]
-
-            # Find closest match in each stem
-            best_stem = 0
-            best_distance = float('inf')
-
-            for stem_idx, stem_name in enumerate(self.stem_names):
-                stem = chunk['stems'][stem_name]
-                if len(stem['frequencies']) == 0:
-                    continue
-
-                # Find nearest sinusoid in this stem
-                freq_diff = np.abs(stem['frequencies'] - fullmix_freq)
-                frame_diff = np.abs(stem['frame_indices'] - fullmix_frame)
-                distance = freq_diff + frame_diff * 0.1  # Weight frame less
-
-                min_dist = np.min(distance)
-                if min_dist < best_distance:
-                    best_distance = min_dist
-                    best_stem = stem_idx
-
-            stem_labels[i] = best_stem
+        stem_labels[:n_valid] = labels[indices]
 
         return {
             'input': torch.from_numpy(input_features),  # [max_sinusoids, 4]
