@@ -90,24 +90,39 @@ def preprocess_song_directory(data_dir, stem_names, sample_rate=44100, n_fft=204
     data_dir = Path(data_dir)
     print(f"\nProcessing {data_dir.name}...")
 
-    # Process fullmix.h5
-    fullmix_h5 = data_dir / 'fullmix.h5'
+    # Process fullmix_tracks.h5
+    fullmix_h5 = data_dir / 'fullmix_tracks.h5'
     if fullmix_h5.exists():
-        print(f"  Converting fullmix.h5...")
+        print(f"  Converting fullmix_tracks.h5...")
         spec = h5_to_spectrogram(fullmix_h5, sample_rate, n_fft, hop_length)
         output_path = data_dir / 'fullmix_spec.npy'
         np.save(output_path, spec)
-        print(f"    Saved {output_path} - Shape: {spec.shape}")
+        print(f"    Saved {output_path.name} - Shape: {spec.shape}")
+    else:
+        print(f"  Skipping: fullmix_tracks.h5 not found")
 
     # Process each stem .h5
     for stem_name in stem_names:
-        h5_path = data_dir / f'{stem_name}.h5'
-        if h5_path.exists():
-            print(f"  Converting {stem_name}.h5...")
-            spec = h5_to_spectrogram(h5_path, sample_rate, n_fft, hop_length)
-            output_path = data_dir / f'{stem_name}_spec.npy'
-            np.save(output_path, spec)
-            print(f"    Saved {output_path} - Shape: {spec.shape}")
+        if stem_name == 'drums':
+            # Process each drum file separately
+            for i in range(1, 5):
+                h5_path = data_dir / f'drums_{i}_tracks.h5'
+                if h5_path.exists():
+                    print(f"  Converting drums_{i}_tracks.h5...")
+                    spec = h5_to_spectrogram(h5_path, sample_rate, n_fft, hop_length)
+                    output_path = data_dir / f'drums_{i}_spec.npy'
+                    np.save(output_path, spec)
+                    print(f"    Saved {output_path.name} - Shape: {spec.shape}")
+        else:
+            h5_path = data_dir / f'{stem_name}_tracks.h5'
+            if h5_path.exists():
+                print(f"  Converting {stem_name}_tracks.h5...")
+                spec = h5_to_spectrogram(h5_path, sample_rate, n_fft, hop_length)
+                output_path = data_dir / f'{stem_name}_spec.npy'
+                np.save(output_path, spec)
+                print(f"    Saved {output_path.name} - Shape: {spec.shape}")
+            else:
+                print(f"  Skipping: {stem_name}_tracks.h5 not found")
 
 
 def main():
