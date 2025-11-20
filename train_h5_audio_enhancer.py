@@ -20,11 +20,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import librosa
-import soundfile as sf
 from pathlib import Path
 from tqdm import tqdm
-import h5py
-from hybrid_resolution_sinusoidal_extractor import HybridResolutionSinusoidalExtractor
 
 
 class H5AudioDataset(Dataset):
@@ -45,9 +42,6 @@ class H5AudioDataset(Dataset):
         self.stem_names = stem_names
         self.sr = sample_rate
         self.segment_samples = int(segment_length * sample_rate)
-
-        # Initialize synthesizer for .h5 files
-        self.synthesizer = HybridResolutionSinusoidalExtractor(sample_rate=sample_rate)
 
         print(f"Loading data from {len(self.data_dirs)} song(s)...")
         self.segments = []
@@ -90,12 +84,21 @@ class H5AudioDataset(Dataset):
         self.total_segments = len(self.segments)
         print(f"\nTotal segments: {self.total_segments}")
 
-        # Cache for synthesized audio (per .h5 file)
-        self._synth_cache = {}
-
     def _load_stem_data(self, h5_path, ogg_paths, stem_name):
         """Load and segment a single stem's .h5 and .ogg data"""
-        print(f"    Found {stem_name}: {h5_path.name} + {len(ogg_paths)} .ogg file(s)")
+
+        # Look for pre-synthesized file
+        synth_path = h5_path.parent / h5_path.name.replace('_tracks.h5', '_synthesized.wav')
+
+        if not synth_path.exists():
+            print(f"    ERROR: Missing synthesized file: {synth_path.name}")
+            print(f"           Run: python presynthesize_h5_files.py --data-dirs {h5_path.parent}")
+            return
+
+        print(f"    Found {stem_name}: {synth_path.name} + {len(ogg_paths)} .ogg file(s)")
+
+        # Load synthesized audio
+        synth_audio, sr = librosa.load(synth_path, sr=self.sr, mono=True)
 
         # Load clean audio
         clean_audio = None
@@ -106,56 +109,23 @@ class H5AudioDataset(Dataset):
             else:
                 clean_audio = clean_audio + audio
 
+        # Match lengths (use shorter of the two)
+        min_len = min(len(synth_audio), len(clean_audio))
+        synth_audio = synth_audio[:min_len]
+        clean_audio = clean_audio[:min_len]
+
         # Calculate number of segments
-        n_segments = len(clean_audio) // self.segment_samples
-        print(f"      Audio length: {len(clean_audio)/self.sr:.2f}s → {n_segments} segments")
+        n_segments = min_len // self.segment_samples
+        print(f"      Audio length: {min_len/self.sr:.2f}s → {n_segments} segments")
 
         # Store segment info
         for seg_idx in range(n_segments):
             self.segments.append({
-                'h5_path': h5_path,
+                'synth_audio': synth_audio,
                 'clean_audio': clean_audio,
                 'segment_idx': seg_idx,
                 'stem_name': stem_name
             })
-
-    def _synthesize_h5(self, h5_path):
-        """Synthesize audio from .h5 file and cache it"""
-        h5_path_str = str(h5_path)
-
-        if h5_path_str not in self._synth_cache:
-            print(f"    Synthesizing {h5_path.name}...")
-
-            # Load tracks from .h5
-            all_channel_tracks, is_stereo = self.synthesizer.load_from_hdf5(h5_path)
-
-            # Determine length from track data
-            with h5py.File(h5_path, 'r') as f:
-                hop_size = int(f.attrs.get('hop', 512))
-                n_channels = int(f.attrs.get('ch', 1))
-
-                max_frame = 0
-                for ch_idx in range(n_channels):
-                    grp_name = f'c{ch_idx}'
-                    if grp_name in f:
-                        track_ends = f[grp_name]['e'][:]
-                        if len(track_ends) > 0:
-                            max_frame = max(max_frame, int(np.max(track_ends)))
-
-                # Convert frames to samples
-                n_samples = max_frame * hop_size + 10000
-
-            # Synthesize audio
-            synthesized = self.synthesizer.synthesize_stereo(all_channel_tracks, n_samples, is_stereo)
-
-            # Convert to mono if stereo
-            if synthesized.ndim == 2:
-                synthesized = np.mean(synthesized, axis=1)
-
-            self._synth_cache[h5_path_str] = synthesized
-            print(f"      Synthesized {len(synthesized)/self.sr:.2f}s of audio")
-
-        return self._synth_cache[h5_path_str]
 
     def __len__(self):
         return self.total_segments
@@ -168,11 +138,8 @@ class H5AudioDataset(Dataset):
         start = seg['segment_idx'] * self.segment_samples
         end = start + self.segment_samples
 
-        # Get synthesized audio from .h5
-        synth_audio = self._synthesize_h5(seg['h5_path'])
-        synth_segment = synth_audio[start:end]
-
-        # Get clean audio segment
+        # Get segments from pre-loaded audio
+        synth_segment = seg['synth_audio'][start:end]
         clean_segment = seg['clean_audio'][start:end]
 
         # Ensure same length (pad if needed)
