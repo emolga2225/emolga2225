@@ -49,6 +49,9 @@ class StemGenerationDataset(Dataset):
         self.segment_samples = int(segment_length * sample_rate)
         self.augment = augment
 
+        # Fixed time dimension for all segments (ensures consistent batch sizes)
+        self.expected_time_frames = self.segment_samples // self.hop_length
+
         # Load audio from all songs
         print(f"Loading audio files from {len(self.data_dirs)} song(s)...")
         self.songs = []
@@ -271,16 +274,21 @@ class StemGenerationDataset(Dataset):
             for name, audio in stem_segments.items()
         }
 
-        # Ensure all spectrograms have the same time dimension
+        # Ensure ALL spectrograms have the FIXED expected time dimension
         # (handles rounding differences between .h5 and audio STFT)
-        target_time_frames = mix_spec.shape[1]
+        # This ensures consistent batch sizes
+        target_time_frames = self.expected_time_frames
 
-        # Resize stem specs to match mix_spec time dimension
+        # Resize mix_spec to fixed dimension
+        if mix_spec.shape[1] != target_time_frames:
+            mix_spec = self._resize_spectrogram(mix_spec, target_time_frames)
+
+        # Resize stem specs to fixed dimension
         for name in stem_specs:
             if stem_specs[name].shape[1] != target_time_frames:
                 stem_specs[name] = self._resize_spectrogram(stem_specs[name], target_time_frames)
 
-        # Resize sinusoidal specs to match mix_spec time dimension
+        # Resize sinusoidal specs to fixed dimension
         for name in sinusoidal_segments:
             if sinusoidal_segments[name].shape[1] != target_time_frames:
                 sinusoidal_segments[name] = self._resize_spectrogram(sinusoidal_segments[name], target_time_frames)
