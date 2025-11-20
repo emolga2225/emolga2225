@@ -72,7 +72,7 @@ def chunk_h5_file(h5_path, frames_per_chunk=344):
             return chunks
 
         # Split into chunks by frame range
-        for chunk_idx in range(n_chunks):
+        for chunk_idx in tqdm(range(n_chunks), desc="      Creating chunks", leave=False):
             start_frame = chunk_idx * frames_per_chunk
             end_frame = start_frame + frames_per_chunk
 
@@ -113,7 +113,7 @@ def preprocess_song_directory(data_dir, stem_names, frames_per_chunk=344):
         print(f"  Chunking fullmix_tracks.h5...")
         chunks = chunk_h5_file(fullmix_h5, frames_per_chunk)
 
-        for idx, chunk in enumerate(chunks):
+        for idx, chunk in tqdm(enumerate(chunks), total=len(chunks), desc="    Saving chunks", leave=False):
             output_path = chunks_dir / f'fullmix_chunk_{idx:04d}.npz'
             np.savez_compressed(output_path, **chunk)
 
@@ -131,7 +131,7 @@ def preprocess_song_directory(data_dir, stem_names, frames_per_chunk=344):
                     print(f"  Chunking drums_{i}_tracks.h5...")
                     chunks = chunk_h5_file(h5_path, frames_per_chunk)
 
-                    for idx, chunk in enumerate(chunks):
+                    for idx, chunk in tqdm(enumerate(chunks), total=len(chunks), desc="    Saving chunks", leave=False):
                         output_path = chunks_dir / f'drums_{i}_chunk_{idx:04d}.npz'
                         np.savez_compressed(output_path, **chunk)
 
@@ -142,7 +142,7 @@ def preprocess_song_directory(data_dir, stem_names, frames_per_chunk=344):
                 print(f"  Chunking {stem_name}_tracks.h5...")
                 chunks = chunk_h5_file(h5_path, frames_per_chunk)
 
-                for idx, chunk in enumerate(chunks):
+                for idx, chunk in tqdm(enumerate(chunks), total=len(chunks), desc="    Saving chunks", leave=False):
                     output_path = chunks_dir / f'{stem_name}_chunk_{idx:04d}.npz'
                     np.savez_compressed(output_path, **chunk)
 
