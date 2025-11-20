@@ -520,7 +520,8 @@ def main():
         dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=0,  # Single-threaded to avoid deadlock with audio loading
+        num_workers=4,  # Parallel data loading to keep GPU fed
+        persistent_workers=True,  # Keep workers alive to avoid deadlock
         pin_memory=True if config['device'] == 'cuda' else False
     )
 
