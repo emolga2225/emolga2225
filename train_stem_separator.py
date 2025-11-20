@@ -60,13 +60,35 @@ class StemSeparationDataset(Dataset):
             stem_specs = {}
             all_found = True
             for stem_name in stem_names:
-                stem_spec_path = data_dir / f'{stem_name}_spec.npy'
-                if not stem_spec_path.exists():
-                    print(f"    ERROR: Missing {stem_spec_path.name}")
-                    all_found = False
-                    break
-                stem_specs[stem_name] = np.load(stem_spec_path)
-                print(f"    Loaded {stem_name}: {stem_specs[stem_name].shape}")
+                if stem_name == 'drums':
+                    # Drums are split into multiple files - load and sum them
+                    drums_combined = None
+                    drums_found = []
+                    for i in range(1, 5):
+                        drum_path = data_dir / f'drums_{i}_spec.npy'
+                        if drum_path.exists():
+                            drum_spec = np.load(drum_path)
+                            drums_found.append(i)
+                            if drums_combined is None:
+                                drums_combined = drum_spec
+                            else:
+                                drums_combined = drums_combined + drum_spec
+
+                    if drums_combined is None:
+                        print(f"    ERROR: No drums files found")
+                        all_found = False
+                        break
+
+                    stem_specs['drums'] = drums_combined
+                    print(f"    Loaded drums (combined {drums_found}): {drums_combined.shape}")
+                else:
+                    stem_spec_path = data_dir / f'{stem_name}_spec.npy'
+                    if not stem_spec_path.exists():
+                        print(f"    ERROR: Missing {stem_spec_path.name}")
+                        all_found = False
+                        break
+                    stem_specs[stem_name] = np.load(stem_spec_path)
+                    print(f"    Loaded {stem_name}: {stem_specs[stem_name].shape}")
 
             if not all_found:
                 continue
