@@ -1,282 +1,297 @@
+#!/usr/bin/env python3
+"""
+Model 1: Stem Separator
+
+Takes fullmix.h5 (ultra-precise synchrosqueeze data) and separates it into
+stem grids (vocals, guitar, bass, drums).
+
+Input: fullmix.h5 grid
+Output: stem grids for vocals, guitar, bass, drums
+Target: stem .h5 grids
+Loss: L1 loss comparing generated vs target stem grids
+
+Uses your precise synchrosqueeze data (NO STFT).
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import h5py
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-import json
 
-class SinusoidalTrackDataset(Dataset):
-    """Dataset for sinusoidal track-to-stem mapping"""
 
-    def __init__(self, mix_h5_files, stem_h5_files, stem_names, max_seq_len=512):
+class StemSeparationDataset(Dataset):
+    """Dataset that loads fullmix and stem .h5 grids for separation training"""
+
+    def __init__(self, data_dirs, stem_names, segment_length_frames=344):
         """
         Args:
-            mix_h5_files: List of HDF5 files containing mix sinusoids
-            stem_h5_files: List of lists, where each inner list contains HDF5 files for each stem
-            stem_names: List of stem names (e.g., ['vocals', 'drums', 'bass', 'other'])
-            max_seq_len: Maximum sequence length for tracks
+            data_dirs: List of directories containing preprocessed .npy files
+            stem_names: List of stem names (e.g., ['vocals', 'guitar', 'bass', 'drums'])
+            segment_length_frames: Number of time frames per segment
         """
-        self.mix_h5_files = mix_h5_files
-        self.stem_h5_files = stem_h5_files
+        if isinstance(data_dirs, str):
+            data_dirs = [data_dirs]
+
+        self.data_dirs = [Path(d) for d in data_dirs]
         self.stem_names = stem_names
-        self.n_stems = len(stem_names)
-        self.max_seq_len = max_seq_len
+        self.segment_frames = segment_length_frames
 
-        # Build index of all tracks
-        self.tracks = []
-        self._build_index()
+        print(f"Loading preprocessed grids from {len(self.data_dirs)} song(s)...")
+        self.segments = []
 
-    def _build_index(self):
-        """Build index of all tracks from mix files"""
-        print("Building dataset index...")
+        for data_dir in self.data_dirs:
+            print(f"\n  Processing {data_dir.name}...")
 
-        for mix_file in tqdm(self.mix_h5_files, desc="Indexing mix files"):
-            with h5py.File(mix_file, 'r') as f:
-                for ch_idx in range(f.attrs['ch']):
-                    grp_name = f'c{ch_idx}'
-                    if grp_name not in f:
-                        continue
+            # Check for preprocessed fullmix grid
+            fullmix_spec_path = data_dir / 'fullmix_spec.npy'
+            if not fullmix_spec_path.exists():
+                print(f"    ERROR: Missing {fullmix_spec_path.name}")
+                print(f"           Run: python preprocess_h5_to_spectrograms.py --data-dirs {data_dir}")
+                continue
 
-                    grp = f[grp_name]
-                    track_lens = grp['len'][:]
+            # Load fullmix grid
+            fullmix_spec = np.load(fullmix_spec_path)
+            print(f"    Loaded fullmix: {fullmix_spec.shape}")
 
-                    for track_idx in range(len(track_lens)):
-                        self.tracks.append({
-                            'mix_file': mix_file,
-                            'channel': ch_idx,
-                            'track_idx': track_idx
-                        })
+            # Load stem grids
+            stem_specs = {}
+            all_found = True
+            for stem_name in stem_names:
+                stem_spec_path = data_dir / f'{stem_name}_spec.npy'
+                if not stem_spec_path.exists():
+                    print(f"    ERROR: Missing {stem_spec_path.name}")
+                    all_found = False
+                    break
+                stem_specs[stem_name] = np.load(stem_spec_path)
+                print(f"    Loaded {stem_name}: {stem_specs[stem_name].shape}")
 
-        print(f"Found {len(self.tracks)} tracks")
+            if not all_found:
+                continue
+
+            # Create segments
+            n_frames = fullmix_spec.shape[1]
+            n_segments = n_frames // self.segment_frames
+
+            print(f"    Creating {n_segments} segments...")
+
+            for seg_idx in range(n_segments):
+                start_frame = seg_idx * self.segment_frames
+                end_frame = start_frame + self.segment_frames
+
+                # Extract segment from fullmix
+                fullmix_segment = fullmix_spec[:, start_frame:end_frame]
+
+                # Extract segments from stems
+                stem_segments = {
+                    name: spec[:, start_frame:end_frame]
+                    for name, spec in stem_specs.items()
+                }
+
+                self.segments.append({
+                    'fullmix': fullmix_segment,
+                    'stems': stem_segments,
+                    'song': data_dir.name
+                })
+
+        print(f"\n  Total segments loaded: {len(self.segments)}")
+        self.total_segments = len(self.segments)
+        print(f"Total segments: {self.total_segments}")
 
     def __len__(self):
-        return len(self.tracks)
-
-    def _load_track_features(self, h5_file, channel, track_idx):
-        """Load features for a single track"""
-        with h5py.File(h5_file, 'r') as f:
-            grp = f[f'c{channel}']
-
-            track_lens = grp['len'][:]
-            all_freqs = grp['f'][:]
-            all_amps = grp['a'][:]
-            all_phases = grp['p'][:]
-            track_bands = grp['b'][:]
-
-            # Find offset for this track
-            offset = sum(track_lens[:track_idx])
-            n = track_lens[track_idx]
-
-            # Extract track data
-            freqs = all_freqs[offset:offset+n]
-            amps = all_amps[offset:offset+n]
-            phases = all_phases[offset:offset+n]
-            band = track_bands[track_idx]
-
-            return freqs, amps, phases, band, n
-
-    def _create_features(self, freqs, amps, phases, band, seq_len):
-        """Create feature vector from track parameters"""
-        # Pad or truncate to max_seq_len
-        if seq_len > self.max_seq_len:
-            freqs = freqs[:self.max_seq_len]
-            amps = amps[:self.max_seq_len]
-            phases = phases[:self.max_seq_len]
-            seq_len = self.max_seq_len
-
-        # Create feature matrix [seq_len, n_features]
-        features = np.zeros((self.max_seq_len, 4), dtype=np.float32)
-
-        # Fill features
-        features[:seq_len, 0] = freqs / 96000.0  # Normalized frequency
-        features[:seq_len, 1] = np.log1p(amps)   # Log amplitude
-        features[:seq_len, 2] = np.cos(phases)   # Phase cos
-        features[:seq_len, 3] = np.sin(phases)   # Phase sin
-
-        # Create mask for valid timesteps
-        mask = np.zeros(self.max_seq_len, dtype=np.float32)
-        mask[:seq_len] = 1.0
-
-        # Add band as a scalar feature
-        band_feature = np.array([band], dtype=np.float32)
-
-        return features, mask, band_feature
+        return self.total_segments
 
     def __getitem__(self, idx):
-        """Get a single training example"""
-        track_info = self.tracks[idx]
+        """Get a training segment"""
+        seg = self.segments[idx]
 
-        # Load mix track
-        mix_freqs, mix_amps, mix_phases, mix_band, mix_len = self._load_track_features(
-            track_info['mix_file'], track_info['channel'], track_info['track_idx']
-        )
+        # Get fullmix grid
+        fullmix = seg['fullmix']  # [freq_bins, time_frames]
 
-        # Create features
-        features, mask, band_feature = self._create_features(
-            mix_freqs, mix_amps, mix_phases, mix_band, mix_len
-        )
-
-        # For now, create dummy label (we'll implement stem matching later)
-        # Label will be the stem index this track belongs to
-        label = np.random.randint(0, self.n_stems)  # Placeholder
+        # Stack stem grids
+        stems = np.stack([
+            seg['stems'][name] for name in self.stem_names
+        ], axis=0)  # [n_stems, freq_bins, time_frames]
 
         return {
-            'features': torch.from_numpy(features),
-            'mask': torch.from_numpy(mask),
-            'band': torch.from_numpy(band_feature),
-            'label': torch.tensor(label, dtype=torch.long)
+            'fullmix': torch.from_numpy(fullmix).float().unsqueeze(0),  # [1, freq, time]
+            'stems': torch.from_numpy(stems).float(),  # [n_stems, freq, time]
         }
 
 
-class StemClassifierTransformer(nn.Module):
-    """Transformer model for classifying sinusoidal tracks to stems"""
+class UNetStemSeparator(nn.Module):
+    """U-Net for separating fullmix grid into stem grids"""
 
-    def __init__(self, n_stems, d_model=128, nhead=8, num_layers=4, max_seq_len=512):
+    def __init__(self, n_stems=4, in_channels=1, base_channels=64):
         super().__init__()
 
         self.n_stems = n_stems
-        self.d_model = d_model
 
-        # Input projection (4 features: freq, log_amp, cos_phase, sin_phase)
-        self.input_proj = nn.Linear(4, d_model)
+        # Encoder
+        self.enc1 = self._conv_block(in_channels, base_channels)
+        self.enc2 = self._conv_block(base_channels, base_channels * 2)
+        self.enc3 = self._conv_block(base_channels * 2, base_channels * 4)
+        self.enc4 = self._conv_block(base_channels * 4, base_channels * 8)
 
-        # Band embedding
-        self.band_embed = nn.Embedding(32, d_model)  # Support up to 32 bands
+        # Bottleneck
+        self.bottleneck = self._conv_block(base_channels * 8, base_channels * 16)
 
-        # Positional encoding
-        self.pos_encoding = nn.Parameter(torch.randn(max_seq_len, d_model))
+        # Decoder
+        self.dec4 = self._conv_block(base_channels * 16 + base_channels * 8, base_channels * 8)
+        self.dec3 = self._conv_block(base_channels * 8 + base_channels * 4, base_channels * 4)
+        self.dec2 = self._conv_block(base_channels * 4 + base_channels * 2, base_channels * 2)
+        self.dec1 = self._conv_block(base_channels * 2 + base_channels, base_channels)
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=0.1,
-            batch_first=True
+        # Output (generate all stems at once)
+        self.out = nn.Conv2d(base_channels, n_stems, kernel_size=1)
+
+        # Pooling and upsampling
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def _conv_block(self, in_ch, out_ch):
+        """Convolution block with BatchNorm and ReLU"""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model, n_stems)
-        )
+    def _match_size(self, x, target):
+        """Match tensor size to target by padding or cropping"""
+        if x.shape[2] > target.shape[2]:
+            diff = x.shape[2] - target.shape[2]
+            x = x[:, :, diff//2:diff//2 + target.shape[2], :]
+        elif x.shape[2] < target.shape[2]:
+            diff = target.shape[2] - x.shape[2]
+            x = nn.functional.pad(x, (0, 0, diff//2, diff - diff//2))
 
-    def forward(self, features, mask, band):
-        """
-        Args:
-            features: [batch, seq_len, 4]
-            mask: [batch, seq_len]
-            band: [batch, 1]
-        """
-        batch_size, seq_len, _ = features.shape
+        if x.shape[3] > target.shape[3]:
+            diff = x.shape[3] - target.shape[3]
+            x = x[:, :, :, diff//2:diff//2 + target.shape[3]]
+        elif x.shape[3] < target.shape[3]:
+            diff = target.shape[3] - x.shape[3]
+            x = nn.functional.pad(x, (diff//2, diff - diff//2, 0, 0))
 
-        # Project input features
-        x = self.input_proj(features)  # [batch, seq_len, d_model]
+        return x
 
-        # Add band embedding (broadcasted across sequence)
-        band_emb = self.band_embed(band.squeeze(-1))  # [batch, d_model]
-        x = x + band_emb.unsqueeze(1)
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
 
-        # Add positional encoding
-        x = x + self.pos_encoding[:seq_len].unsqueeze(0)
+        # Bottleneck
+        b = self.bottleneck(self.pool(e4))
 
-        # Create attention mask (True = masked position)
-        attn_mask = (mask == 0)  # [batch, seq_len]
+        # Decoder with skip connections
+        d4 = self.upsample(b)
+        d4 = self._match_size(d4, e4)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
 
-        # Transformer encoding
-        x = self.transformer(x, src_key_padding_mask=attn_mask)
+        d3 = self.upsample(d4)
+        d3 = self._match_size(d3, e3)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
 
-        # Global average pooling (masked)
-        mask_expanded = mask.unsqueeze(-1)  # [batch, seq_len, 1]
-        x_masked = x * mask_expanded
-        x_sum = x_masked.sum(dim=1)
-        mask_sum = mask_expanded.sum(dim=1).clamp(min=1)
-        x_avg = x_sum / mask_sum
+        d2 = self.upsample(d3)
+        d2 = self._match_size(d2, e2)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
 
-        # Classification
-        logits = self.classifier(x_avg)
+        d1 = self.upsample(d2)
+        d1 = self._match_size(d1, e1)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
 
-        return logits
+        # Output: [batch, n_stems, freq, time]
+        output = self.out(d1)
+        output = self.relu(output)
+
+        return output
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device):
     """Train for one epoch"""
     model.train()
     total_loss = 0
-    correct = 0
-    total = 0
 
     pbar = tqdm(dataloader, desc="Training")
     for batch in pbar:
-        features = batch['features'].to(device)
-        mask = batch['mask'].to(device)
-        band = batch['band'].to(device)
-        labels = batch['label'].to(device)
+        fullmix = batch['fullmix'].to(device)
+        stems = batch['stems'].to(device)
 
         optimizer.zero_grad()
 
-        # Forward pass
-        logits = model(features, mask, band)
-        loss = criterion(logits, labels)
+        # Forward pass: separate fullmix into stems
+        generated_stems = model(fullmix)
+
+        # Resize if needed
+        if generated_stems.shape != stems.shape:
+            generated_stems = torch.nn.functional.interpolate(
+                generated_stems,
+                size=stems.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
+
+        # Loss: L1 distance between generated and target stem grids
+        loss = criterion(generated_stems, stems)
 
         # Backward pass
         loss.backward()
         optimizer.step()
 
-        # Stats
         total_loss += loss.item()
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
-
-    return total_loss / len(dataloader), 100. * correct / total
+    return total_loss / len(dataloader)
 
 
 def main():
-    # Configuration
+    import argparse
+    parser = argparse.ArgumentParser(description='Train stem separator (Model 1)')
+    parser.add_argument('--data-dirs', nargs='+', default=['.'])
+    parser.add_argument('--stem-names', nargs='+', default=['vocals', 'guitar', 'bass', 'drums'])
+    parser.add_argument('--segment-length-frames', type=int, default=344)
+    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_separator')
+
+    args = parser.parse_args()
+
+    # Config
     config = {
-        'stem_names': ['vocals', 'drums', 'bass', 'other'],
-        'max_seq_len': 512,
-        'd_model': 128,
-        'nhead': 8,
-        'num_layers': 4,
-        'batch_size': 32,
-        'learning_rate': 1e-4,
-        'num_epochs': 100,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'stem_names': args.stem_names,
+        'segment_length_frames': args.segment_length_frames,
+        'batch_size': args.batch_size,
+        'learning_rate': args.lr,
     }
 
-    print("Stem Separator Training")
+    print("=" * 60)
+    print("Model 1: Stem Separator Training")
+    print("=" * 60)
     print(f"Device: {config['device']}")
     print(f"Stems: {config['stem_names']}")
+    print(f"Segment length: {config['segment_length_frames']} frames")
 
-    # TODO: Replace with actual file paths
-    mix_h5_files = ['mix_tracks.h5']  # List of mix HDF5 files
-    stem_h5_files = [
-        ['vocals_tracks.h5'],  # Vocals stem files
-        ['drums_tracks.h5'],   # Drums stem files
-        ['bass_tracks.h5'],    # Bass stem files
-        ['other_tracks.h5']    # Other stem files
-    ]
-
-    # Create dataset and dataloader
+    # Create dataset
     print("\nCreating dataset...")
-    dataset = SinusoidalTrackDataset(
-        mix_h5_files=mix_h5_files,
-        stem_h5_files=stem_h5_files,
-        stem_names=config['stem_names'],
-        max_seq_len=config['max_seq_len']
+    dataset = StemSeparationDataset(
+        args.data_dirs,
+        config['stem_names'],
+        segment_length_frames=config['segment_length_frames']
     )
 
     dataloader = DataLoader(
@@ -284,55 +299,52 @@ def main():
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=4,
+        persistent_workers=True,
         pin_memory=True if config['device'] == 'cuda' else False
     )
 
     # Create model
     print("\nCreating model...")
-    model = StemClassifierTransformer(
+    model = UNetStemSeparator(
         n_stems=len(config['stem_names']),
-        d_model=config['d_model'],
-        nhead=config['nhead'],
-        num_layers=config['num_layers'],
-        max_seq_len=config['max_seq_len']
-    ).to(config['device'])
+        in_channels=1,
+        base_channels=64
+    )
+    model = model.to(config['device'])
 
+    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
 
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])
+    # Optimizer and loss
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    criterion = nn.L1Loss()
+
+    # Create checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(exist_ok=True)
 
     # Training loop
     print("\nStarting training...")
-    for epoch in range(config['num_epochs']):
-        print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
+    print("=" * 60)
 
-        train_loss, train_acc = train_epoch(model, dataloader, optimizer, criterion, config['device'])
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
 
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        train_loss = train_epoch(model, dataloader, optimizer, criterion, config['device'])
+        print(f"Train Loss: {train_loss:.4f}")
 
-        # Save checkpoint
-        if (epoch + 1) % 10 == 0:
-            checkpoint = {
+        # Save checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            checkpoint_path = checkpoint_dir / f'model_epoch_{epoch}.pt'
+            torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'config': config,
-                'train_loss': train_loss,
-                'train_acc': train_acc
-            }
-            torch.save(checkpoint, f'stem_separator_epoch_{epoch+1}.pt')
-            print(f"Saved checkpoint: stem_separator_epoch_{epoch+1}.pt")
-
-    # Save final model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': config
-    }, 'stem_separator_final.pt')
-    print("\nTraining complete! Saved final model: stem_separator_final.pt")
+                'loss': train_loss,
+            }, checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
