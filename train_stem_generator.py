@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Generative Stem Separator - Proper Architecture
+Generative Stem Separator - Using Custom Synchrosqueeze Data
 
-Input: Fullmix spectrogram + sinusoidal conditioning
-Output: Generated stem spectrograms (vocals, guitar, bass, drums)
-Loss: L1 loss comparing generated vs ground truth stem spectrograms
+Input: fullmix.h5 (ultra-precise synchrosqueeze + filtered data, better than STFT)
+Auxiliary: stem .h5 files (harmonic content/relationships - algorithmically perfect)
+Target: stem .ogg spectrograms (what it should actually sound like)
 
-This learns to GENERATE stems, not just classify/rearrange sinusoids.
+Loss:
+  - Primary: L1 loss vs stem audio spectrograms
+  - Auxiliary: L1 loss vs stem .h5 harmonic data (weighted 0.3x)
+
+This learns to GENERATE stems using precise frequency data as input and guidance.
 """
 
 import torch
@@ -51,6 +55,11 @@ class StemGenerationDataset(Dataset):
 
         for data_dir in self.data_dirs:
             print(f"\n  Loading from {data_dir.name}...")
+
+            # Store path to fullmix.h5 for lazy loading (ultra-precise synchrosqueeze data)
+            fullmix_h5_path = data_dir / 'fullmix.h5'
+
+            # Load fullmix audio just to get length for segmentation
             fullmix = self._load_audio(data_dir / 'fullmix.ogg')
             stems = {}
 
@@ -97,9 +106,10 @@ class StemGenerationDataset(Dataset):
             n_segments = fullmix.shape[1] // self.segment_samples
 
             self.songs.append({
-                'fullmix': fullmix,
-                'stems': stems,
-                'h5_paths': h5_paths,
+                'fullmix': fullmix,  # Only used for length calculation, not training input
+                'fullmix_h5_path': fullmix_h5_path,  # Ultra-precise synchrosqueeze data (input)
+                'stems': stems,  # Target audio
+                'h5_paths': h5_paths,  # Stem harmonic content (auxiliary guidance)
                 'n_segments': n_segments,
                 'dir': data_dir
             })
@@ -217,14 +227,18 @@ class StemGenerationDataset(Dataset):
                 start = segment_idx * self.segment_samples
                 end = start + self.segment_samples
 
-                # Extract audio segments (handle stereo: [2, samples])
-                mix_segment = song['fullmix'][:, start:end]
+                # Load fullmix.h5 segment (ultra-precise synchrosqueeze input)
+                mix_spec = self._load_sinusoidal_segment_h5(
+                    song['fullmix_h5_path'], start, end
+                )
+
+                # Extract stem audio segments (target output)
                 stem_segments = {
                     name: audio[:, start:end]
                     for name, audio in song['stems'].items()
                 }
 
-                # Lazy load sinusoidal spectrograms for this segment only
+                # Lazy load stem .h5 segments (harmonic content guidance)
                 # (avoids loading 200MB-1.2GB .h5 files all at once)
                 sinusoidal_segments = {}
                 for name, h5_path in song['h5_paths'].items():
@@ -236,8 +250,8 @@ class StemGenerationDataset(Dataset):
         else:
             raise IndexError(f"Segment index {idx} out of range")
 
-        # Compute spectrograms
-        mix_spec = self._compute_spectrogram(mix_segment)
+        # Compute spectrograms from stem audio (target output)
+        # mix_spec already loaded from fullmix.h5
         stem_specs = {
             name: self._compute_spectrogram(audio)
             for name, audio in stem_segments.items()
