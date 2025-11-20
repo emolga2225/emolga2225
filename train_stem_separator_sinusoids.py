@@ -22,9 +22,9 @@ class SinusoidChunkDataset(Dataset):
     def __init__(self, data_dirs, stem_names=['vocals', 'guitar', 'bass', 'drums'], max_sinusoids=10000):
         self.stem_names = stem_names
         self.max_sinusoids = max_sinusoids
-        self.chunk_paths = []
+        self.chunks = []
 
-        print("Loading labeled chunks...")
+        print("Loading labeled chunks into memory...")
         for data_dir in data_dirs:
             data_dir = Path(data_dir)
             chunks_dir = data_dir / 'labeled_chunks'
@@ -35,19 +35,28 @@ class SinusoidChunkDataset(Dataset):
 
             # Find all chunk files
             chunk_files = sorted(chunks_dir.glob('chunk_*.npz'))
-            print(f"  {data_dir.name}: {len(chunk_files)} chunks")
+            print(f"  Loading {data_dir.name}: {len(chunk_files)} chunks...")
 
-            self.chunk_paths.extend(chunk_files)
+            # Load all chunks into memory
+            for chunk_path in tqdm(chunk_files, desc=f"    Loading {data_dir.name}", leave=False):
+                chunk_data = np.load(chunk_path)
+                self.chunks.append({
+                    'frequencies': chunk_data['frequencies'],
+                    'amplitudes': chunk_data['amplitudes'],
+                    'phases': chunk_data['phases'],
+                    'frame_indices': chunk_data['frame_indices'],
+                    'labels': chunk_data['labels']
+                })
 
-        print(f"Total chunks loaded: {len(self.chunk_paths)}")
+        print(f"Total chunks loaded: {len(self.chunks)}")
 
     def __len__(self):
-        return len(self.chunk_paths)
+        return len(self.chunks)
 
     def __getitem__(self, idx):
         """Get a training chunk"""
-        # Load chunk (pre-labeled during preprocessing)
-        chunk_data = np.load(self.chunk_paths[idx])
+        # Get pre-loaded chunk from memory
+        chunk_data = self.chunks[idx]
 
         frequencies = chunk_data['frequencies']
         amplitudes = chunk_data['amplitudes']
