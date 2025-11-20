@@ -53,27 +53,29 @@ def h5_to_spectrogram(h5_path, sample_rate=44100, n_fft=2048, hop_length=512):
             grp = f[grp_name]
 
             # Load all track data
-            track_lens = grp['len'][:]
             frequencies = grp['f'][:]
             amplitudes = grp['a'][:]
             frame_indices = grp['i'][:]
 
-            # Reconstruct spectrogram from sinusoidal tracks
-            offset = 0
-            for track_len in tqdm(track_lens, desc=f"  Channel {ch_idx}", leave=False):
-                track_freqs = frequencies[offset:offset + track_len]
-                track_amps = amplitudes[offset:offset + track_len]
-                track_frames = frame_indices[offset:offset + track_len]
+            print(f"    Channel {ch_idx}: {len(frequencies)} sinusoids")
 
-                # Add each sinusoid to the spectrogram
-                for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
-                    if 0 <= frame < n_frames:
-                        # Convert frequency to bin index
-                        bin_idx = int(freq * n_fft / sr)
-                        if 0 <= bin_idx < n_bins:
-                            spec[bin_idx, int(frame)] += amp
+            # Vectorized reconstruction - process all sinusoids at once
+            # Convert frequencies to bin indices
+            bin_indices = (frequencies * n_fft / sr).astype(np.int32)
+            frame_indices_int = frame_indices.astype(np.int32)
 
-                offset += track_len
+            # Filter valid indices
+            valid_mask = (
+                (frame_indices_int >= 0) & (frame_indices_int < n_frames) &
+                (bin_indices >= 0) & (bin_indices < n_bins)
+            )
+
+            bin_indices = bin_indices[valid_mask]
+            frame_indices_int = frame_indices_int[valid_mask]
+            amplitudes = amplitudes[valid_mask]
+
+            # Accumulate values into spectrogram (handles duplicate indices)
+            np.add.at(spec, (bin_indices, frame_indices_int), amplitudes)
 
         # Average across channels
         if n_channels > 0:
