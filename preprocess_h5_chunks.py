@@ -71,16 +71,20 @@ def chunk_h5_file(h5_path, frames_per_chunk=344):
         else:
             return chunks
 
-        # Split into chunks by frame range
-        for chunk_idx in tqdm(range(n_chunks), desc="      Creating chunks", leave=False):
+        # Vectorized chunking - assign each sinusoid to a chunk
+        chunk_assignments = (combined_frames // frames_per_chunk).astype(np.int32)
+
+        # Get unique chunk indices
+        unique_chunks = np.unique(chunk_assignments)
+
+        print(f"      Splitting into {len(unique_chunks)} chunks...")
+
+        # Split by chunk assignment
+        for chunk_idx in unique_chunks:
+            mask = chunk_assignments == chunk_idx
+
             start_frame = chunk_idx * frames_per_chunk
             end_frame = start_frame + frames_per_chunk
-
-            # Find sinusoids in this frame range
-            mask = (combined_frames >= start_frame) & (combined_frames < end_frame)
-
-            if np.sum(mask) == 0:
-                continue  # Skip empty chunks
 
             chunk_data = {
                 'frequencies': combined_freqs[mask],
