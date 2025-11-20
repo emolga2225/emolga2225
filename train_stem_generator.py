@@ -213,6 +213,20 @@ class StemGenerationDataset(Dataset):
         log_mag = np.log1p(magnitude)
         return log_mag
 
+    def _resize_spectrogram(self, spec, target_time_frames):
+        """Resize spectrogram to target time dimension by padding or cropping"""
+        current_frames = spec.shape[1]
+
+        if current_frames == target_time_frames:
+            return spec
+        elif current_frames < target_time_frames:
+            # Pad with zeros
+            pad_width = ((0, 0), (0, target_time_frames - current_frames))
+            return np.pad(spec, pad_width, mode='constant', constant_values=0)
+        else:
+            # Crop
+            return spec[:, :target_time_frames]
+
     def __len__(self):
         return self.total_segments
 
@@ -256,6 +270,20 @@ class StemGenerationDataset(Dataset):
             name: self._compute_spectrogram(audio)
             for name, audio in stem_segments.items()
         }
+
+        # Ensure all spectrograms have the same time dimension
+        # (handles rounding differences between .h5 and audio STFT)
+        target_time_frames = mix_spec.shape[1]
+
+        # Resize stem specs to match mix_spec time dimension
+        for name in stem_specs:
+            if stem_specs[name].shape[1] != target_time_frames:
+                stem_specs[name] = self._resize_spectrogram(stem_specs[name], target_time_frames)
+
+        # Resize sinusoidal specs to match mix_spec time dimension
+        for name in sinusoidal_segments:
+            if sinusoidal_segments[name].shape[1] != target_time_frames:
+                sinusoidal_segments[name] = self._resize_spectrogram(sinusoidal_segments[name], target_time_frames)
 
         # Stack stem spectrograms: [n_stems, freq_bins, time_frames]
         stem_specs_array = np.stack([
