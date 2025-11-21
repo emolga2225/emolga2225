@@ -20,7 +20,7 @@ import gc
 
 
 def load_all_sinusoids_from_h5(h5_path):
-    """Load ALL sinusoids from HDF5 file at once"""
+    """Load ALL sinusoids from HDF5 file at once (track-aware)"""
     sinusoids = []
 
     with h5py.File(h5_path, 'r') as f:
@@ -33,14 +33,27 @@ def load_all_sinusoids_from_h5(h5_path):
 
             grp = f[grp_name]
 
-            # Load ALL sinusoid data at once
+            # Load track structure (CRITICAL for correct amplitude loading!)
+            track_lens = grp['len'][:]
+
+            # Load concatenated sinusoid data
             frequencies = grp['f'][:]
             amplitudes = grp['a'][:]
             frame_indices = grp['i'][:]
 
-            # Create sinusoid array
-            for freq, amp, frame in zip(frequencies, amplitudes, frame_indices):
-                sinusoids.append([freq, amp, frame])
+            # Process each track (respecting track boundaries)
+            offset = 0
+            for track_len in track_lens:
+                # Extract data for this track
+                track_freqs = frequencies[offset:offset + track_len]
+                track_amps = amplitudes[offset:offset + track_len]
+                track_frames = frame_indices[offset:offset + track_len]
+
+                # Add sinusoids from this track
+                for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
+                    sinusoids.append([freq, amp, frame])
+
+                offset += track_len
 
     return np.array(sinusoids, dtype=np.float32) if len(sinusoids) > 0 else np.zeros((0, 3), dtype=np.float32)
 
