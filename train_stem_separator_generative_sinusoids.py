@@ -318,9 +318,29 @@ def sinusoidal_loss(pred_stems, target_stems):
     """
     Loss between predicted and target stem sinusoids.
     Uses L1 loss on [freq, amp, frame] values.
+
+    IMPORTANT: Ignores padded zeros (where amplitude = 0) to prevent
+    the model from collapsing to outputting all zeros.
     """
-    # Simple L1 loss on all parameters
-    loss = nn.functional.l1_loss(pred_stems, target_stems)
+    # Create mask for non-padded sinusoids (amplitude > 0)
+    # target_stems: [batch, n_stems, max_output_per_stem, 3]
+    # Amplitude is index 1
+    mask = (target_stems[:, :, :, 1] > 0).unsqueeze(-1)  # [batch, n_stems, max_output_per_stem, 1]
+
+    # Count non-zero entries
+    num_valid = mask.sum()
+
+    if num_valid == 0:
+        # All zeros in batch - shouldn't happen but handle gracefully
+        return torch.tensor(0.0, device=pred_stems.device)
+
+    # Apply mask and compute loss only on non-padded sinusoids
+    masked_pred = pred_stems * mask
+    masked_target = target_stems * mask
+
+    # L1 loss normalized by number of valid entries
+    loss = (masked_pred - masked_target).abs().sum() / num_valid
+
     return loss
 
 
