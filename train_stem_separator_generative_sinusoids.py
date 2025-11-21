@@ -95,7 +95,10 @@ class SinusoidalStemDataset(Dataset):
             for chunk_idx in range(n_chunks):
                 stem_h5_paths = {}
                 for stem_name in stem_names:
-                    stem_h5 = data_dir / f'{stem_name}.h5'
+                    # Try _tracks.h5 suffix first, then plain .h5
+                    stem_h5 = data_dir / f'{stem_name}_tracks.h5'
+                    if not stem_h5.exists():
+                        stem_h5 = data_dir / f'{stem_name}.h5'
                     if stem_h5.exists():
                         stem_h5_paths[stem_name] = stem_h5
 

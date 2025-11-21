@@ -95,7 +95,11 @@ def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=51
     # Load stem sinusoids ONCE
     stem_all = {}
     for stem_name in stem_names:
-        stem_h5 = data_dir / f'{stem_name}.h5'
+        # Try _tracks.h5 suffix first, then plain .h5
+        stem_h5 = data_dir / f'{stem_name}_tracks.h5'
+        if not stem_h5.exists():
+            stem_h5 = data_dir / f'{stem_name}.h5'
+
         if stem_h5.exists():
             print(f"    Loading {stem_name}...")
             stem_all[stem_name] = load_all_sinusoids_from_h5(stem_h5)
