@@ -193,36 +193,47 @@ def process_audio(audio_path, model, config, device='cuda', chunk_length=4.0):
             # Generate stems
             generated_stems = model(mix_spec)
 
-            # Convert back to audio for each stem
-            for stem_idx, stem_name in enumerate(config['stem_names']):
-                # Get stem spectrogram
+            # Convert generated spectrograms to soft masks and apply to mix
+            # This preserves phase relationships from the original mix
+
+            # First, collect all stem spectrograms and resize to match mix
+            stem_specs = []
+            for stem_idx in range(len(config['stem_names'])):
                 stem_spec = generated_stems[0, stem_idx].cpu().numpy()
 
                 # Match size to original magnitude
                 if stem_spec.shape != magnitude.shape:
-                    # Resize using interpolation
                     from scipy.ndimage import zoom
                     zoom_factors = (magnitude.shape[0] / stem_spec.shape[0],
                                    magnitude.shape[1] / stem_spec.shape[1])
                     stem_spec = zoom(stem_spec, zoom_factors, order=1)
 
-                # Clip to prevent overflow (log(1+x) where x is magnitude, so clip to reasonable range)
-                # log(1 + 100) ≈ 4.6, so values up to ~10 are reasonable
+                # Clip to prevent overflow
                 stem_spec = np.clip(stem_spec, 0, 10)
 
-                # Convert from log scale back to linear
+                # Convert from log scale to linear
                 stem_magnitude = np.expm1(stem_spec)
+                stem_specs.append(stem_magnitude)
 
-                # Clip magnitude to prevent extreme values
-                stem_magnitude = np.clip(stem_magnitude, 0, np.max(magnitude) * 2)
+            # Stack all stems and create soft masks
+            stem_specs = np.array(stem_specs)  # [n_stems, freq, time]
 
-                # Use original phase (simple approach - could use Griffin-Lim for better quality)
-                stem_stft = stem_magnitude * np.exp(1j * phase)
+            # Sum all stems to get total energy
+            total_energy = np.sum(stem_specs, axis=0) + 1e-10  # Add epsilon to avoid division by zero
+
+            # Create soft masks by normalizing
+            masks = stem_specs / total_energy  # [n_stems, freq, time]
+
+            # Apply masks to original mix STFT (preserves phase!)
+            for stem_idx, stem_name in enumerate(config['stem_names']):
+                # Apply mask to mix STFT
+                mask = masks[stem_idx]
+                stem_stft = mask * (magnitude * np.exp(1j * phase))
 
                 # ISTFT to get audio
                 stem_chunk_mono = librosa.istft(stem_stft, hop_length=hop_length, length=chunk.shape[1])
 
-                # Convert back to stereo (simple duplication - could use more sophisticated approach)
+                # Convert back to stereo
                 stem_chunk_stereo = np.stack([stem_chunk_mono, stem_chunk_mono])
 
                 # Add to output
