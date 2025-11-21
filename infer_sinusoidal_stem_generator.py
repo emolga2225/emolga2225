@@ -85,10 +85,11 @@ class SinusoidalTransformer(nn.Module):
 
         stems = torch.stack(stem_outputs, dim=1)
 
-        # Apply constraints
-        stems[:, :, :, 0] = torch.relu(stems[:, :, :, 0])  # freq >= 0
-        stems[:, :, :, 1] = torch.relu(stems[:, :, :, 1])  # amp >= 0
-        stems[:, :, :, 2] = torch.relu(stems[:, :, :, 2])  # frame >= 0
+        # Apply constraints for NORMALIZED values (all features in 0-1 range):
+        # - freq: 0-1 (normalized from 0-22050 Hz)
+        # - amp: 0-1 (already in this range)
+        # - frame: 0-1 (normalized from 0-chunk_frames)
+        stems = torch.clamp(stems, min=0.0, max=1.0)
 
         return stems
 
@@ -256,8 +257,13 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
                 padding = np.zeros((config['max_input_sinusoids'] - len(chunk_sines), 3))
                 chunk_sines = np.vstack([chunk_sines, padding])
 
+            # NORMALIZE input: Scale features to 0-1 range (same as training)
+            chunk_sines_norm = chunk_sines.copy()
+            chunk_sines_norm[:, 0] /= 22050.0  # normalize frequency
+            chunk_sines_norm[:, 2] /= chunk_frames  # normalize frame
+
             # Convert to tensor
-            chunk_tensor = torch.from_numpy(chunk_sines).float().unsqueeze(0).to(device)
+            chunk_tensor = torch.from_numpy(chunk_sines_norm).float().unsqueeze(0).to(device)
 
             # Generate stems
             generated_stems = model(chunk_tensor)  # [1, n_stems, max_output_per_stem, 3]
@@ -265,6 +271,10 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
             # Synthesize audio for each stem
             for stem_idx, stem_name in enumerate(config['stem_names']):
                 stem_sines = generated_stems[0, stem_idx].cpu().numpy()
+
+                # DENORMALIZE output: Convert from 0-1 back to original ranges
+                stem_sines[:, 0] *= 22050.0  # denormalize frequency
+                stem_sines[:, 2] *= chunk_frames  # denormalize frame
 
                 # Make frames absolute again
                 stem_sines[:, 2] += start_frame

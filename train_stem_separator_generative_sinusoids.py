@@ -255,9 +255,21 @@ class SinusoidalStemDataset(Dataset):
 
         stem_sines = np.stack(processed_stems, axis=0)  # [n_stems, max_output_per_stem, 3]
 
+        # NORMALIZE: Scale features to similar ranges
+        # freq: 0-22050 Hz -> 0-1 (divide by 22050)
+        # amp: already 0-1 range (keep as is)
+        # frame: 0-chunk_frames -> 0-1 (divide by chunk_frames)
+        fullmix_sines_norm = fullmix_sines.copy()
+        fullmix_sines_norm[:, 0] /= 22050.0  # normalize frequency
+        fullmix_sines_norm[:, 2] /= self.chunk_frames  # normalize frame
+
+        stem_sines_norm = stem_sines.copy()
+        stem_sines_norm[:, :, 0] /= 22050.0  # normalize frequency
+        stem_sines_norm[:, :, 2] /= self.chunk_frames  # normalize frame
+
         return {
-            'fullmix': torch.from_numpy(fullmix_sines).float(),  # [max_sinusoids, 3]
-            'stems': torch.from_numpy(stem_sines).float(),  # [n_stems, max_output_per_stem, 3]
+            'fullmix': torch.from_numpy(fullmix_sines_norm).float(),  # [max_sinusoids, 3]
+            'stems': torch.from_numpy(stem_sines_norm).float(),  # [n_stems, max_output_per_stem, 3]
         }
 
 
@@ -335,13 +347,11 @@ class SinusoidalTransformer(nn.Module):
 
         stems = torch.stack(stem_outputs, dim=1)  # [batch, n_stems, max_output_per_stem, 3]
 
-        # Apply constraints:
-        # - freq should be positive
-        # - amp should be positive
-        # - frame should be in valid range
-        stems[:, :, :, 0] = torch.relu(stems[:, :, :, 0])  # freq >= 0
-        stems[:, :, :, 1] = torch.relu(stems[:, :, :, 1])  # amp >= 0
-        stems[:, :, :, 2] = torch.relu(stems[:, :, :, 2])  # frame >= 0
+        # Apply constraints for NORMALIZED values (all features in 0-1 range):
+        # - freq: 0-1 (normalized from 0-22050 Hz)
+        # - amp: 0-1 (already in this range)
+        # - frame: 0-1 (normalized from 0-chunk_frames)
+        stems = torch.clamp(stems, min=0.0, max=1.0)
 
         return stems
 
@@ -422,6 +432,11 @@ def main():
                        help='Max output sinusoids per stem')
     args = parser.parse_args()
 
+    # Chunk parameters for normalization
+    chunk_duration = 4.0
+    hop_length = 512
+    chunk_frames = int(chunk_duration * 44100 / hop_length)
+
     config = {
         'stem_names': ['vocals', 'guitar', 'bass', 'drums'],
         'data_dirs': args.data_dirs,
@@ -433,7 +448,10 @@ def main():
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'd_model': 256,
         'nhead': 8,
-        'num_layers': 6
+        'num_layers': 6,
+        'chunk_duration': chunk_duration,
+        'hop_length': hop_length,
+        'chunk_frames': chunk_frames
     }
 
     print("=" * 60)
