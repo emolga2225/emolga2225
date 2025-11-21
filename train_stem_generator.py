@@ -506,8 +506,10 @@ def main():
                        help='Checkpoint to resume training from')
     parser.add_argument('--epochs', type=int, default=1000,
                        help='Number of epochs to train')
-    parser.add_argument('--batch-size', type=int, default=16,
-                       help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=4,
+                       help='Batch size (reduce if getting OOM errors)')
+    parser.add_argument('--base-channels', type=int, default=32,
+                       help='Base channels for U-Net (32 for 8GB GPU, 64 for larger GPUs)')
     args = parser.parse_args()
 
     config = {
@@ -521,7 +523,7 @@ def main():
         'learning_rate': 1e-4,
         'num_epochs': args.epochs,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'base_channels': 64  # Increased capacity
+        'base_channels': args.base_channels
     }
 
     print("Generative Stem Separator Training")
