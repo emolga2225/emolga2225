@@ -206,8 +206,15 @@ def process_audio(audio_path, model, config, device='cuda', chunk_length=4.0):
                                    magnitude.shape[1] / stem_spec.shape[1])
                     stem_spec = zoom(stem_spec, zoom_factors, order=1)
 
+                # Clip to prevent overflow (log(1+x) where x is magnitude, so clip to reasonable range)
+                # log(1 + 100) ≈ 4.6, so values up to ~10 are reasonable
+                stem_spec = np.clip(stem_spec, 0, 10)
+
                 # Convert from log scale back to linear
                 stem_magnitude = np.expm1(stem_spec)
+
+                # Clip magnitude to prevent extreme values
+                stem_magnitude = np.clip(stem_magnitude, 0, np.max(magnitude) * 2)
 
                 # Use original phase (simple approach - could use Griffin-Lim for better quality)
                 stem_stft = stem_magnitude * np.exp(1j * phase)
