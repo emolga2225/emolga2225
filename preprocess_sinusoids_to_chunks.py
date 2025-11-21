@@ -17,11 +17,8 @@ import argparse
 from tqdm import tqdm
 
 
-def extract_sinusoids_from_h5(h5_path, chunk_frames, chunk_idx):
-    """Extract sinusoids from a specific time chunk"""
-    start_frame = chunk_idx * chunk_frames
-    end_frame = start_frame + chunk_frames
-
+def load_all_sinusoids_from_h5(h5_path):
+    """Load ALL sinusoids from HDF5 file at once"""
     sinusoids = []
 
     with h5py.File(h5_path, 'r') as f:
@@ -34,34 +31,32 @@ def extract_sinusoids_from_h5(h5_path, chunk_frames, chunk_idx):
 
             grp = f[grp_name]
 
-            # Load track data
-            track_lens = grp['len'][:]
-            track_starts = grp['s'][:]
-            track_ends = grp['e'][:]
-
+            # Load ALL sinusoid data at once
             frequencies = grp['f'][:]
             amplitudes = grp['a'][:]
             frame_indices = grp['i'][:]
 
-            # Process tracks that overlap with this chunk
-            offset = 0
-            for track_idx, track_len in enumerate(track_lens):
-                track_start = track_starts[track_idx]
-                track_end = track_ends[track_idx]
-
-                if track_end >= start_frame and track_start < end_frame:
-                    track_freqs = frequencies[offset:offset + track_len]
-                    track_amps = amplitudes[offset:offset + track_len]
-                    track_frames = frame_indices[offset:offset + track_len]
-
-                    for freq, amp, frame in zip(track_freqs, track_amps, track_frames):
-                        if start_frame <= frame < end_frame:
-                            local_frame = frame - start_frame
-                            sinusoids.append([freq, amp, local_frame])
-
-                offset += track_len
+            # Create sinusoid array
+            for freq, amp, frame in zip(frequencies, amplitudes, frame_indices):
+                sinusoids.append([freq, amp, frame])
 
     return np.array(sinusoids, dtype=np.float32) if len(sinusoids) > 0 else np.zeros((0, 3), dtype=np.float32)
+
+
+def chunk_sinusoids(all_sinusoids, chunk_idx, chunk_frames):
+    """Extract a chunk from already-loaded sinusoids"""
+    start_frame = chunk_idx * chunk_frames
+    end_frame = start_frame + chunk_frames
+
+    # Filter sinusoids in this time range
+    mask = (all_sinusoids[:, 2] >= start_frame) & (all_sinusoids[:, 2] < end_frame)
+    chunk_sines = all_sinusoids[mask].copy()
+
+    # Make frames chunk-relative
+    if len(chunk_sines) > 0:
+        chunk_sines[:, 2] -= start_frame
+
+    return chunk_sines
 
 
 def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=512):
@@ -91,23 +86,35 @@ def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=51
     if n_chunks == 0:
         n_chunks = 1
 
-    print(f"  Processing {n_chunks} chunks...")
+    print(f"  Loading all sinusoids from .h5 files...")
+
+    # Load fullmix sinusoids ONCE
+    print(f"    Loading fullmix...")
+    fullmix_all = load_all_sinusoids_from_h5(fullmix_h5)
+
+    # Load stem sinusoids ONCE
+    stem_all = {}
+    for stem_name in stem_names:
+        stem_h5 = data_dir / f'{stem_name}.h5'
+        if stem_h5.exists():
+            print(f"    Loading {stem_name}...")
+            stem_all[stem_name] = load_all_sinusoids_from_h5(stem_h5)
 
     # Create chunks directory
     chunks_dir = data_dir / 'sinusoid_chunks'
     chunks_dir.mkdir(exist_ok=True)
 
-    # Process each chunk
+    # Now chunk the loaded sinusoids (fast!)
+    print(f"  Creating {n_chunks} chunks...")
     for chunk_idx in tqdm(range(n_chunks), desc=f"  {data_dir.name}"):
-        # Extract fullmix sinusoids
-        fullmix_sines = extract_sinusoids_from_h5(fullmix_h5, chunk_frames, chunk_idx)
+        # Extract fullmix chunk
+        fullmix_sines = chunk_sinusoids(fullmix_all, chunk_idx, chunk_frames)
 
-        # Extract stem sinusoids
+        # Extract stem chunks
         stem_data = {}
         for stem_name in stem_names:
-            stem_h5 = data_dir / f'{stem_name}.h5'
-            if stem_h5.exists():
-                stem_sines = extract_sinusoids_from_h5(stem_h5, chunk_frames, chunk_idx)
+            if stem_name in stem_all:
+                stem_sines = chunk_sinusoids(stem_all[stem_name], chunk_idx, chunk_frames)
                 stem_data[stem_name] = stem_sines
 
         # Save chunk
