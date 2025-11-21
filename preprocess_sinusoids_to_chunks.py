@@ -45,6 +45,33 @@ def load_all_sinusoids_from_h5(h5_path):
     return np.array(sinusoids, dtype=np.float32) if len(sinusoids) > 0 else np.zeros((0, 3), dtype=np.float32)
 
 
+def load_and_merge_drum_files(data_dir):
+    """Load and merge multiple drum files (drums_1, drums_2, drums_3, etc.)"""
+    all_sinusoids = []
+
+    # Try to find all drum files
+    drum_files = []
+    for i in range(1, 10):  # Check drums_1 through drums_9
+        drum_h5 = data_dir / f'drums_{i}_tracks.h5'
+        if drum_h5.exists():
+            drum_files.append(drum_h5)
+
+    if not drum_files:
+        return None
+
+    print(f"    Found {len(drum_files)} drum files, merging...")
+    for drum_file in drum_files:
+        sinusoids = load_all_sinusoids_from_h5(drum_file)
+        if len(sinusoids) > 0:
+            all_sinusoids.append(sinusoids)
+
+    if not all_sinusoids:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    # Merge all drum sinusoids
+    return np.vstack(all_sinusoids)
+
+
 def chunk_sinusoids(all_sinusoids, chunk_idx, chunk_frames):
     """Extract a chunk from already-loaded sinusoids"""
     start_frame = chunk_idx * chunk_frames
@@ -107,17 +134,46 @@ def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=51
 
     # STEP 2: Process each stem one at a time (updates existing chunk files)
     for stem_name in stem_names:
-        # Try _tracks.h5 suffix first, then plain .h5
-        stem_h5 = data_dir / f'{stem_name}_tracks.h5'
-        if not stem_h5.exists():
-            stem_h5 = data_dir / f'{stem_name}.h5'
+        stem_all = None
 
-        if not stem_h5.exists():
-            print(f"  Skipping {stem_name} (not found)")
-            continue
+        # Special case: drums can be split across multiple files
+        if stem_name == 'drums':
+            stem_all = load_and_merge_drum_files(data_dir)
+            if stem_all is None:
+                print(f"  Skipping {stem_name} (not found)")
+                continue
 
-        print(f"  Processing {stem_name}...")
-        stem_all = load_all_sinusoids_from_h5(stem_h5)
+        # Special case: bass can be named "bass" or "rhythm"
+        elif stem_name == 'bass':
+            # Try bass_tracks.h5, then rhythm_tracks.h5
+            stem_h5 = data_dir / 'bass_tracks.h5'
+            if not stem_h5.exists():
+                stem_h5 = data_dir / 'rhythm_tracks.h5'
+            if not stem_h5.exists():
+                stem_h5 = data_dir / 'bass.h5'
+            if not stem_h5.exists():
+                stem_h5 = data_dir / 'rhythm.h5'
+
+            if not stem_h5.exists():
+                print(f"  Skipping {stem_name} (not found)")
+                continue
+
+            print(f"  Processing {stem_name}... (using {stem_h5.name})")
+            stem_all = load_all_sinusoids_from_h5(stem_h5)
+
+        # Regular stems
+        else:
+            # Try _tracks.h5 suffix first, then plain .h5
+            stem_h5 = data_dir / f'{stem_name}_tracks.h5'
+            if not stem_h5.exists():
+                stem_h5 = data_dir / f'{stem_name}.h5'
+
+            if not stem_h5.exists():
+                print(f"  Skipping {stem_name} (not found)")
+                continue
+
+            print(f"  Processing {stem_name}...")
+            stem_all = load_all_sinusoids_from_h5(stem_h5)
 
         # Add stem data to each existing chunk
         for chunk_idx in tqdm(range(n_chunks), desc=f"  Adding {stem_name}"):

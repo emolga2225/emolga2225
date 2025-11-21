@@ -23,6 +23,38 @@ from tqdm import tqdm
 import argparse
 
 
+def find_stem_h5_file(data_dir, stem_name):
+    """Find the .h5 file for a stem, handling special cases"""
+    data_dir = Path(data_dir)
+
+    # Special case: bass can be named "bass" or "rhythm"
+    if stem_name == 'bass':
+        for name in ['bass_tracks.h5', 'rhythm_tracks.h5', 'bass.h5', 'rhythm.h5']:
+            stem_h5 = data_dir / name
+            if stem_h5.exists():
+                return stem_h5
+        return None
+
+    # Special case: drums might be split across files (just return first one for now)
+    # Preprocessing merges them, so this is only for fallback
+    if stem_name == 'drums':
+        stem_h5 = data_dir / 'drums_1_tracks.h5'
+        if stem_h5.exists():
+            return stem_h5
+        # Otherwise fall through to regular check
+
+    # Regular stems: try _tracks.h5 first, then .h5
+    stem_h5 = data_dir / f'{stem_name}_tracks.h5'
+    if stem_h5.exists():
+        return stem_h5
+
+    stem_h5 = data_dir / f'{stem_name}.h5'
+    if stem_h5.exists():
+        return stem_h5
+
+    return None
+
+
 class SinusoidalStemDataset(Dataset):
     """Dataset that loads fullmix and stem sinusoids from HDF5 files"""
 
@@ -95,11 +127,8 @@ class SinusoidalStemDataset(Dataset):
             for chunk_idx in range(n_chunks):
                 stem_h5_paths = {}
                 for stem_name in stem_names:
-                    # Try _tracks.h5 suffix first, then plain .h5
-                    stem_h5 = data_dir / f'{stem_name}_tracks.h5'
-                    if not stem_h5.exists():
-                        stem_h5 = data_dir / f'{stem_name}.h5'
-                    if stem_h5.exists():
+                    stem_h5 = find_stem_h5_file(data_dir, stem_name)
+                    if stem_h5 is not None:
                         stem_h5_paths[stem_name] = stem_h5
 
                 self.chunks.append({
