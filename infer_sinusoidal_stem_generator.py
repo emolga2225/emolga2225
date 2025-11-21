@@ -222,8 +222,11 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
         print("Warning: No sinusoids found in input!")
         return {name: np.zeros(44100) for name in config['stem_names']}
 
-    # Calculate chunks
-    chunk_frames = int(chunk_duration * 44100 / hop_length)
+    # Use config values if available, otherwise use defaults
+    chunk_duration = config.get('chunk_duration', chunk_duration)
+    hop_length = config.get('hop_length', hop_length)
+    chunk_frames = config.get('chunk_frames', int(chunk_duration * 44100 / hop_length))
+
     n_chunks = int(np.ceil(max_frame / chunk_frames))
 
     print(f"Processing {n_chunks} chunks...")
@@ -275,6 +278,13 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
                 # DENORMALIZE output: Convert from 0-1 back to original ranges
                 stem_sines[:, 0] *= 22050.0  # denormalize frequency
                 stem_sines[:, 2] *= chunk_frames  # denormalize frame
+
+                # Filter out NaN/inf values (model might output invalid values early in training)
+                valid_mask = np.isfinite(stem_sines).all(axis=1) & (stem_sines[:, 1] > 0)
+                stem_sines = stem_sines[valid_mask]
+
+                if len(stem_sines) == 0:
+                    continue  # No valid sinusoids in this chunk
 
                 # Make frames absolute again
                 stem_sines[:, 2] += start_frame
