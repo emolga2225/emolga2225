@@ -55,7 +55,22 @@ class SinusoidalStemDataset(Dataset):
         for data_dir in self.data_dirs:
             print(f"\n  Loading from {data_dir.name}...")
 
-            # Check for fullmix
+            # Check for preprocessed chunks (FAST)
+            chunks_dir = data_dir / 'sinusoid_chunks'
+            if chunks_dir.exists():
+                print(f"    Using preprocessed chunks from {chunks_dir.name}/")
+                chunk_files = sorted(chunks_dir.glob('chunk_*.npz'))
+                for chunk_file in chunk_files:
+                    self.chunks.append({
+                        'npz_file': chunk_file,
+                        'use_npz': True,
+                        'dir': data_dir
+                    })
+                print(f"    Loaded {len(chunk_files)} preprocessed chunks")
+                continue
+
+            # Fallback: Use .h5 files (SLOW)
+            print(f"    No preprocessed chunks found, will use .h5 files (slow)")
             fullmix_h5 = data_dir / 'fullmix_tracks.h5'
             if not fullmix_h5.exists():
                 fullmix_h5 = data_dir / 'fullmix.h5'
@@ -88,10 +103,11 @@ class SinusoidalStemDataset(Dataset):
                     'fullmix_h5': fullmix_h5,
                     'stem_h5_paths': stem_h5_paths,
                     'chunk_idx': chunk_idx,
+                    'use_npz': False,
                     'dir': data_dir
                 })
 
-            print(f"    Loaded {n_chunks} chunks")
+            print(f"    Loaded {n_chunks} chunks from .h5 files")
 
         print(f"\nTotal chunks: {len(self.chunks)}")
 
@@ -150,35 +166,51 @@ class SinusoidalStemDataset(Dataset):
     def __getitem__(self, idx):
         chunk_info = self.chunks[idx]
 
-        # Load fullmix sinusoids
-        fullmix_sines = self._load_sinusoids_from_chunk(
-            chunk_info['fullmix_h5'],
-            chunk_info['chunk_idx']
-        )
+        if chunk_info['use_npz']:
+            # FAST: Load from preprocessed .npz file
+            data = np.load(chunk_info['npz_file'])
+            fullmix_sines = data['fullmix']
 
-        # Limit to max_sinusoids
+            # Load stems
+            stem_sines = []
+            for stem_name in self.stem_names:
+                if stem_name in data:
+                    sines = data[stem_name]
+                else:
+                    sines = np.zeros((0, 3))
+                stem_sines.append(sines)
+
+        else:
+            # SLOW: Load from .h5 files
+            fullmix_sines = self._load_sinusoids_from_chunk(
+                chunk_info['fullmix_h5'],
+                chunk_info['chunk_idx']
+            )
+
+            # Load stem sinusoids
+            stem_sines = []
+            for stem_name in self.stem_names:
+                if stem_name in chunk_info['stem_h5_paths']:
+                    sines = self._load_sinusoids_from_chunk(
+                        chunk_info['stem_h5_paths'][stem_name],
+                        chunk_info['chunk_idx']
+                    )
+                else:
+                    sines = np.zeros((0, 3))
+                stem_sines.append(sines)
+
+        # Limit and pad fullmix
         if len(fullmix_sines) > self.max_sinusoids:
-            # Sample uniformly
             indices = np.linspace(0, len(fullmix_sines) - 1, self.max_sinusoids, dtype=int)
             fullmix_sines = fullmix_sines[indices]
 
-        # Pad if needed
         if len(fullmix_sines) < self.max_sinusoids:
             padding = np.zeros((self.max_sinusoids - len(fullmix_sines), 3))
             fullmix_sines = np.vstack([fullmix_sines, padding])
 
-        # Load stem sinusoids
-        stem_sines = []
-        for stem_name in self.stem_names:
-            if stem_name in chunk_info['stem_h5_paths']:
-                sines = self._load_sinusoids_from_chunk(
-                    chunk_info['stem_h5_paths'][stem_name],
-                    chunk_info['chunk_idx']
-                )
-            else:
-                sines = np.zeros((0, 3))
-
-            # Limit and pad
+        # Limit and pad stems
+        processed_stems = []
+        for sines in stem_sines:
             if len(sines) > self.max_output_per_stem:
                 indices = np.linspace(0, len(sines) - 1, self.max_output_per_stem, dtype=int)
                 sines = sines[indices]
@@ -187,9 +219,9 @@ class SinusoidalStemDataset(Dataset):
                 padding = np.zeros((self.max_output_per_stem - len(sines), 3))
                 sines = np.vstack([sines, padding])
 
-            stem_sines.append(sines)
+            processed_stems.append(sines)
 
-        stem_sines = np.stack(stem_sines, axis=0)  # [n_stems, max_output_per_stem, 3]
+        stem_sines = np.stack(processed_stems, axis=0)  # [n_stems, max_output_per_stem, 3]
 
         return {
             'fullmix': torch.from_numpy(fullmix_sines).float(),  # [max_sinusoids, 3]
