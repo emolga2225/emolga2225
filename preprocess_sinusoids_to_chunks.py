@@ -3,6 +3,7 @@
 Preprocess HDF5 sinusoids to chunked .npz files for fast training.
 
 This converts slow HDF5 sinusoidal tracks into fast numpy chunks.
+Memory-efficient: processes one stem at a time to avoid OOM.
 
 Run once:
     python preprocess_sinusoids_to_chunks.py --data-dirs ajfa/ blackned/ dyerseve/
@@ -15,6 +16,7 @@ import h5py
 from pathlib import Path
 import argparse
 from tqdm import tqdm
+import gc
 
 
 def load_all_sinusoids_from_h5(h5_path):
@@ -60,7 +62,7 @@ def chunk_sinusoids(all_sinusoids, chunk_idx, chunk_frames):
 
 
 def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=512):
-    """Preprocess all HDF5 files in a directory to chunked .npz"""
+    """Preprocess all HDF5 files in a directory to chunked .npz (memory-efficient)"""
     data_dir = Path(data_dir)
     print(f"\nPreprocessing {data_dir.name}...")
 
@@ -86,44 +88,55 @@ def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=51
     if n_chunks == 0:
         n_chunks = 1
 
-    print(f"  Loading all sinusoids from .h5 files...")
+    # Create chunks directory
+    chunks_dir = data_dir / 'sinusoid_chunks'
+    chunks_dir.mkdir(exist_ok=True)
 
-    # Load fullmix sinusoids ONCE
-    print(f"    Loading fullmix...")
+    # STEP 1: Process fullmix first (creates all chunk files with just fullmix)
+    print(f"  Processing fullmix...")
     fullmix_all = load_all_sinusoids_from_h5(fullmix_h5)
 
-    # Load stem sinusoids ONCE
-    stem_all = {}
+    for chunk_idx in tqdm(range(n_chunks), desc=f"  Creating chunks"):
+        fullmix_sines = chunk_sinusoids(fullmix_all, chunk_idx, chunk_frames)
+        chunk_file = chunks_dir / f'chunk_{chunk_idx:04d}.npz'
+        np.savez_compressed(chunk_file, fullmix=fullmix_sines)
+
+    # Clear fullmix from memory
+    del fullmix_all
+    gc.collect()
+
+    # STEP 2: Process each stem one at a time (updates existing chunk files)
     for stem_name in stem_names:
         # Try _tracks.h5 suffix first, then plain .h5
         stem_h5 = data_dir / f'{stem_name}_tracks.h5'
         if not stem_h5.exists():
             stem_h5 = data_dir / f'{stem_name}.h5'
 
-        if stem_h5.exists():
-            print(f"    Loading {stem_name}...")
-            stem_all[stem_name] = load_all_sinusoids_from_h5(stem_h5)
+        if not stem_h5.exists():
+            print(f"  Skipping {stem_name} (not found)")
+            continue
 
-    # Create chunks directory
-    chunks_dir = data_dir / 'sinusoid_chunks'
-    chunks_dir.mkdir(exist_ok=True)
+        print(f"  Processing {stem_name}...")
+        stem_all = load_all_sinusoids_from_h5(stem_h5)
 
-    # Now chunk the loaded sinusoids (fast!)
-    print(f"  Creating {n_chunks} chunks...")
-    for chunk_idx in tqdm(range(n_chunks), desc=f"  {data_dir.name}"):
-        # Extract fullmix chunk
-        fullmix_sines = chunk_sinusoids(fullmix_all, chunk_idx, chunk_frames)
+        # Add stem data to each existing chunk
+        for chunk_idx in tqdm(range(n_chunks), desc=f"  Adding {stem_name}"):
+            stem_sines = chunk_sinusoids(stem_all, chunk_idx, chunk_frames)
 
-        # Extract stem chunks
-        stem_data = {}
-        for stem_name in stem_names:
-            if stem_name in stem_all:
-                stem_sines = chunk_sinusoids(stem_all[stem_name], chunk_idx, chunk_frames)
-                stem_data[stem_name] = stem_sines
+            # Load existing chunk
+            chunk_file = chunks_dir / f'chunk_{chunk_idx:04d}.npz'
+            existing_data = np.load(chunk_file)
 
-        # Save chunk
-        chunk_file = chunks_dir / f'chunk_{chunk_idx:04d}.npz'
-        np.savez_compressed(chunk_file, fullmix=fullmix_sines, **stem_data)
+            # Combine with new stem data
+            updated_data = {key: existing_data[key] for key in existing_data.files}
+            updated_data[stem_name] = stem_sines
+
+            # Save updated chunk
+            np.savez_compressed(chunk_file, **updated_data)
+
+        # Clear stem from memory before loading next one
+        del stem_all
+        gc.collect()
 
     print(f"  Saved {n_chunks} chunks to {chunks_dir}")
 
@@ -144,6 +157,7 @@ def main():
     print(f"Processing {len(args.data_dirs)} directories...")
     print(f"Stems: {args.stem_names}")
     print(f"Chunk duration: {args.chunk_duration}s")
+    print(f"Memory-efficient mode: processing one stem at a time")
 
     for data_dir in args.data_dirs:
         preprocess_directory(data_dir, args.stem_names, args.chunk_duration)
