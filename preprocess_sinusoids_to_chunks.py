@@ -215,7 +215,7 @@ def main():
     parser.add_argument('--data-dirs', nargs='+', required=True,
                        help='Directories containing HDF5 files')
     parser.add_argument('--stem-names', nargs='+',
-                       default=['vocals', 'guitar', 'bass', 'drums'],
+                       default=['vocals', 'guitar', 'bass', 'drums', 'song'],
                        help='Stem names to process')
     parser.add_argument('--chunk-duration', type=float, default=4.0,
                        help='Chunk duration in seconds')

@@ -438,7 +438,7 @@ def main():
     chunk_frames = int(chunk_duration * 44100 / hop_length)
 
     config = {
-        'stem_names': ['vocals', 'guitar', 'bass', 'drums'],
+        'stem_names': ['vocals', 'guitar', 'bass', 'drums', 'song'],
         'data_dirs': args.data_dirs,
         'max_input_sinusoids': args.max_input_sinusoids,
         'max_output_per_stem': args.max_output_per_stem,
