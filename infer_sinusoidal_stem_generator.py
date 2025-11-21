@@ -236,6 +236,9 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
     total_duration = (max_frame + 1) * hop_length
     stem_audio = {name: np.zeros(total_duration) for name in config['stem_names']}
 
+    # Debug counters
+    debug_stats = {name: {'valid_sines': 0, 'total_sines': 0, 'chunks': 0} for name in config['stem_names']}
+
     with torch.no_grad():
         for chunk_idx in tqdm(range(n_chunks)):
             start_frame = chunk_idx * chunk_frames
@@ -271,17 +274,35 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
             # Generate stems
             generated_stems = model(chunk_tensor)  # [1, n_stems, max_output_per_stem, 3]
 
+            # Debug: print first chunk stats
+            if chunk_idx == 0:
+                print("\n=== Debug: First Chunk Model Outputs ===")
+                for stem_idx, stem_name in enumerate(config['stem_names']):
+                    stem_out = generated_stems[0, stem_idx].cpu().numpy()
+                    print(f"{stem_name}:")
+                    print(f"  Freq range: {stem_out[:, 0].min():.4f} - {stem_out[:, 0].max():.4f}")
+                    print(f"  Amp range:  {stem_out[:, 1].min():.4f} - {stem_out[:, 1].max():.4f}")
+                    print(f"  Frame range: {stem_out[:, 2].min():.4f} - {stem_out[:, 2].max():.4f}")
+                    print(f"  Non-zero amps: {(stem_out[:, 1] > 0.01).sum()} / {len(stem_out)}")
+
             # Synthesize audio for each stem
             for stem_idx, stem_name in enumerate(config['stem_names']):
                 stem_sines = generated_stems[0, stem_idx].cpu().numpy()
 
+                # Track stats
+                debug_stats[stem_name]['total_sines'] += len(stem_sines)
+                debug_stats[stem_name]['chunks'] += 1
+
                 # DENORMALIZE output: Convert from 0-1 back to original ranges
                 stem_sines[:, 0] *= 22050.0  # denormalize frequency
                 stem_sines[:, 2] *= chunk_frames  # denormalize frame
+                # amplitude stays in 0-1 range
 
                 # Filter out NaN/inf values (model might output invalid values early in training)
-                valid_mask = np.isfinite(stem_sines).all(axis=1) & (stem_sines[:, 1] > 0)
+                valid_mask = np.isfinite(stem_sines).all(axis=1) & (stem_sines[:, 1] > 0.01)
                 stem_sines = stem_sines[valid_mask]
+
+                debug_stats[stem_name]['valid_sines'] += len(stem_sines)
 
                 if len(stem_sines) == 0:
                     continue  # No valid sinusoids in this chunk
@@ -304,6 +325,17 @@ def process_sinusoids(h5_path, model, config, device, chunk_duration=4.0, hop_le
                 # Add to output
                 actual_end = min(start_sample + len(chunk_audio), total_duration)
                 stem_audio[stem_name][start_sample:actual_end] += chunk_audio[:actual_end - start_sample]
+
+    # Print debug stats
+    print("\n=== Generation Statistics ===")
+    for stem_name in config['stem_names']:
+        stats = debug_stats[stem_name]
+        print(f"{stem_name}:")
+        print(f"  Total output sinusoids: {stats['total_sines']}")
+        print(f"  Valid sinusoids (amp > 0.01): {stats['valid_sines']}")
+        print(f"  Chunks processed: {stats['chunks']}")
+        if stats['total_sines'] > 0:
+            print(f"  Valid ratio: {stats['valid_sines'] / stats['total_sines'] * 100:.1f}%")
 
     # Normalize each stem
     for stem_name in stem_audio:
