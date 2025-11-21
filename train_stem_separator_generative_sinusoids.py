@@ -332,14 +332,16 @@ def sinusoidal_loss(pred_stems, target_stems):
 
     if num_valid == 0:
         # All zeros in batch - shouldn't happen but handle gracefully
-        return torch.tensor(0.0, device=pred_stems.device)
+        # Return zero loss but maintain gradient connection
+        return (pred_stems.sum() * 0.0)
 
     # Apply mask and compute loss only on non-padded sinusoids
     masked_pred = pred_stems * mask
     masked_target = target_stems * mask
 
     # L1 loss normalized by number of valid entries
-    loss = (masked_pred - masked_target).abs().sum() / num_valid
+    # Add small epsilon to avoid division by zero
+    loss = (masked_pred - masked_target).abs().sum() / (num_valid + 1e-8)
 
     return loss
 
