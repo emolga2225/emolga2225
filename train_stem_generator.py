@@ -59,21 +59,29 @@ class StemGenerationDataset(Dataset):
         for data_dir in self.data_dirs:
             print(f"\n  Loading from {data_dir.name}...")
 
-            # Check if fullmix .h5 exists for ultra-precise synchrosqueeze data
-            # Try fullmix_tracks.h5 first, then fallback to fullmix.h5
-            fullmix_h5_path = data_dir / 'fullmix_tracks.h5'
-            if not fullmix_h5_path.exists():
-                fullmix_h5_path = data_dir / 'fullmix.h5'
+            # Check for preprocessed dense spectrograms (much faster than H5)
+            fullmix_spec_npy = data_dir / 'fullmix_spec.npy'
+            if fullmix_spec_npy.exists():
+                print(f"    Loading preprocessed fullmix_spec.npy...")
+                fullmix_spec = np.load(fullmix_spec_npy)
+                fullmix_h5_path = None  # Use preprocessed data instead
+            else:
+                # Check if fullmix .h5 exists for ultra-precise synchrosqueeze data
+                # Try fullmix_tracks.h5 first, then fallback to fullmix.h5
+                fullmix_h5_path = data_dir / 'fullmix_tracks.h5'
                 if not fullmix_h5_path.exists():
-                    fullmix_h5_path = None  # Will use fullmix.ogg spectrogram as fallback
+                    fullmix_h5_path = data_dir / 'fullmix.h5'
+                    if not fullmix_h5_path.exists():
+                        fullmix_h5_path = None  # Will use fullmix.ogg spectrogram as fallback
+                fullmix_spec = None  # Will load on-the-fly from H5
 
             # Load fullmix audio (used for length calculation and as fallback input)
             fullmix = self._load_audio(data_dir / 'fullmix.ogg')
             stems = {}
 
-            # Store paths to sinusoidal .h5 files (lazy loading for memory efficiency)
-            # .h5 files are 200MB-1.2GB each, so we can't load them all upfront
-            h5_paths = {}
+            # Load preprocessed stem spectrograms or store H5 paths for lazy loading
+            stem_specs_npy = {}  # Preprocessed dense spectrograms (fast)
+            h5_paths = {}  # Fallback to H5 lazy loading (slow)
 
             for name in stem_names:
                 if name == 'drums':
@@ -105,19 +113,26 @@ class StemGenerationDataset(Dataset):
                     if stem_path.exists():
                         stems[name] = self._load_audio(stem_path)
 
-                # Store .h5 file path for lazy loading
-                h5_path = data_dir / f'{name}.h5'
-                if h5_path.exists():
-                    h5_paths[name] = h5_path
+                # Check for preprocessed .npy spectrogram (fast)
+                spec_npy_path = data_dir / f'{name}_spec.npy'
+                if spec_npy_path.exists():
+                    stem_specs_npy[name] = np.load(spec_npy_path)
+                else:
+                    # Fallback: store .h5 file path for lazy loading (slow)
+                    h5_path = data_dir / f'{name}.h5'
+                    if h5_path.exists():
+                        h5_paths[name] = h5_path
 
             # Calculate segments for this song
             n_segments = fullmix.shape[1] // self.segment_samples
 
             self.songs.append({
                 'fullmix': fullmix,  # Used for length calculation and as fallback input if .h5 missing
-                'fullmix_h5_path': fullmix_h5_path,  # Ultra-precise synchrosqueeze data (input, if available)
+                'fullmix_spec': fullmix_spec,  # Preprocessed fullmix spectrogram (fast, if available)
+                'fullmix_h5_path': fullmix_h5_path,  # Ultra-precise synchrosqueeze data (slow fallback)
                 'stems': stems,  # Target audio
-                'h5_paths': h5_paths,  # Stem harmonic content (auxiliary guidance)
+                'stem_specs_npy': stem_specs_npy,  # Preprocessed stem spectrograms (fast, if available)
+                'h5_paths': h5_paths,  # Stem harmonic content (slow fallback)
                 'n_segments': n_segments,
                 'dir': data_dir
             })
@@ -262,9 +277,14 @@ class StemGenerationDataset(Dataset):
                 start = segment_idx * self.segment_samples
                 end = start + self.segment_samples
 
-                # Load fullmix input (prefer .h5 if available, else compute from audio)
-                if song['fullmix_h5_path'] is not None:
-                    # Use ultra-precise synchrosqueeze data from .h5
+                # Load fullmix input (prefer preprocessed .npy, then .h5, then audio)
+                if song['fullmix_spec'] is not None:
+                    # FAST: slice preprocessed dense spectrogram
+                    start_frame = start // self.hop_length
+                    end_frame = end // self.hop_length
+                    mix_spec = song['fullmix_spec'][:, start_frame:end_frame]
+                elif song['fullmix_h5_path'] is not None:
+                    # SLOW: load from .h5 sinusoidal tracks
                     mix_spec = self._load_sinusoidal_segment_h5(
                         song['fullmix_h5_path'], start, end
                     )
@@ -279,13 +299,20 @@ class StemGenerationDataset(Dataset):
                     for name, audio in song['stems'].items()
                 }
 
-                # Lazy load stem .h5 segments (harmonic content guidance)
-                # (avoids loading 200MB-1.2GB .h5 files all at once)
+                # Load stem sinusoidal segments (prefer preprocessed .npy, then .h5)
                 sinusoidal_segments = {}
-                for name, h5_path in song['h5_paths'].items():
-                    sinusoidal_segments[name] = self._load_sinusoidal_segment_h5(
-                        h5_path, start, end
-                    )
+                start_frame = start // self.hop_length
+                end_frame = end // self.hop_length
+
+                for name in self.stem_names:
+                    if name in song['stem_specs_npy']:
+                        # FAST: slice preprocessed dense spectrogram
+                        sinusoidal_segments[name] = song['stem_specs_npy'][name][:, start_frame:end_frame]
+                    elif name in song['h5_paths']:
+                        # SLOW: load from .h5 sinusoidal tracks
+                        sinusoidal_segments[name] = self._load_sinusoidal_segment_h5(
+                            song['h5_paths'][name], start, end
+                        )
                 break
             cumulative += song['n_segments']
         else:
