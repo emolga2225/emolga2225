@@ -302,28 +302,50 @@ class TransformerStemSeparator(nn.Module):
         return output
 
 
-def train_epoch(model, dataloader, optimizer, device):
-    """Train for one epoch"""
+def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_steps=1, use_amp=False):
+    """Train for one epoch with gradient accumulation and optional mixed precision"""
     model.train()
     total_loss = 0
 
-    for fullmix, stems in tqdm(dataloader, desc="Training"):
+    # Initialize GradScaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
+    for batch_idx, (fullmix, stems) in enumerate(tqdm(dataloader, desc="Training")):
         fullmix = fullmix.to(device)
         stems = stems.to(device)
 
-        optimizer.zero_grad()
+        # Mixed precision context
+        with torch.cuda.amp.autocast() if use_amp else torch.enable_grad():
+            # Forward pass
+            pred_stems = model(fullmix)
 
-        # Forward pass
-        pred_stems = model(fullmix)
+            # L1 loss
+            loss = F.l1_loss(pred_stems, stems)
 
-        # L1 loss
-        loss = F.l1_loss(pred_stems, stems)
+            # Scale loss for gradient accumulation
+            loss = loss / gradient_accumulation_steps
 
         # Backward pass
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-        total_loss += loss.item()
+        # Update weights every gradient_accumulation_steps
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * gradient_accumulation_steps
+
+        # Free memory
+        del fullmix, stems, pred_stems, loss
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     return total_loss / len(dataloader)
 
@@ -333,10 +355,16 @@ def main():
     parser.add_argument('--data-dirs', nargs='+', required=True)
     parser.add_argument('--stem-names', nargs='+',
                        default=['vocals', 'guitar', 'bass', 'drums', 'song'])
-    parser.add_argument('--chunk-duration', type=float, default=4.0)
-    parser.add_argument('--max-sinusoids', type=int, default=500,
-                       help='Max sinusoids per frame (will truncate/pad)')
-    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--chunk-duration', type=float, default=1.0,
+                       help='Duration of each chunk in seconds (default: 1.0 for memory efficiency)')
+    parser.add_argument('--max-sinusoids', type=int, default=2000,
+                       help='Max sinusoids per frame (will truncate/pad). Use inspect_max_sinusoids.py to find optimal value.')
+    parser.add_argument('--batch-size', type=int, default=1,
+                       help='Actual batch size (keep small for memory, use gradient-accumulation for larger effective batch)')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
+                       help='Accumulate gradients over N steps (effective batch = batch-size * N)')
+    parser.add_argument('--mixed-precision', action='store_true',
+                       help='Use mixed precision (fp16) training to reduce memory')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--d-model', type=int, default=256)
@@ -380,10 +408,29 @@ def main():
     print(f"Data representation: ({chunk_frames} frames, {args.max_sinusoids} sinusoids/frame, 3 features)")
     print(f"Features per sinusoid: [exact_freq_Hz, amplitude, phase_radians]")
     print(f"Stems: {args.stem_names}")
+    print(f"\nMemory optimizations:")
+    print(f"  Chunk duration: {args.chunk_duration}s ({chunk_frames} frames)")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Gradient accumulation: {args.gradient_accumulation_steps} steps")
+    print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    print(f"  Mixed precision: {args.mixed_precision}")
+
+    # Estimate memory per sample
+    bytes_per_sample = chunk_frames * args.max_sinusoids * 3 * 4  # float32
+    mb_per_sample = bytes_per_sample / (1024**2)
+    mb_stems = mb_per_sample * len(args.stem_names)
+    print(f"\nEstimated memory per sample:")
+    print(f"  Fullmix: {mb_per_sample:.1f} MB")
+    print(f"  All stems: {mb_stems:.1f} MB")
+    print(f"  Per batch: {(mb_per_sample + mb_stems) * args.batch_size:.1f} MB")
 
     # Training loop
     for epoch in range(args.epochs):
-        loss = train_epoch(model, dataloader, optimizer, device)
+        loss = train_epoch(
+            model, dataloader, optimizer, device,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            use_amp=args.mixed_precision
+        )
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {loss:.6f}")
 
         # Save checkpoint every 10 epochs
