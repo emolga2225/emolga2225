@@ -27,23 +27,21 @@ import json
 from collections import defaultdict
 
 
-def get_sinusoids_for_frame(h5_path, frame_idx, max_sinusoids_per_frame=2000):
+def load_all_frames_from_h5(h5_path, max_sinusoids_per_frame=2000):
     """
-    Extract sinusoids for a specific frame from HDF5 file.
+    Load ALL frames from HDF5 file at once (much faster than per-frame loading).
 
     Returns:
-        array of shape (max_sinusoids_per_frame, 3) where 3 = [freq, amp, phase]
+        dict: frame_idx -> array of shape (max_sinusoids_per_frame, 3)
     """
-    array = np.zeros((max_sinusoids_per_frame, 3), dtype=np.float32)
+    frame_data = {}
 
     if not h5_path.exists():
-        return array
-
-    sinusoids = []
+        return frame_data
 
     with h5py.File(h5_path, 'r') as f:
         if 'c0' not in f:
-            return array
+            return frame_data
 
         grp = f['c0']
         track_lens = grp['len'][:]
@@ -52,29 +50,34 @@ def get_sinusoids_for_frame(h5_path, frame_idx, max_sinusoids_per_frame=2000):
         phases = grp['p'][:] if 'p' in grp else np.zeros_like(amplitudes)
         frames = grp['i'][:]
 
-        # Process each track
+        # Group sinusoids by frame (much faster than processing each frame separately)
+        frame_sinusoids = defaultdict(list)
+
         offset = 0
         for track_len in track_lens:
+            track_freqs = frequencies[offset:offset + track_len]
+            track_amps = amplitudes[offset:offset + track_len]
+            track_phases = phases[offset:offset + track_len]
             track_frames = frames[offset:offset + track_len]
 
-            # Find sinusoids at this specific frame
-            mask = track_frames == frame_idx
-            if mask.any():
-                freq = frequencies[offset:offset + track_len][mask][0]
-                amp = amplitudes[offset:offset + track_len][mask][0]
-                phase = phases[offset:offset + track_len][mask][0]
-                sinusoids.append([freq, amp, phase])
+            # Add all sinusoids from this track to their respective frames
+            for freq, amp, phase, frame_idx in zip(track_freqs, track_amps, track_phases, track_frames):
+                frame_sinusoids[int(frame_idx)].append([freq, amp, phase])
 
             offset += track_len
 
-    # Fill array
-    if sinusoids:
+    # Convert to arrays
+    for frame_idx, sinusoids in frame_sinusoids.items():
+        array = np.zeros((max_sinusoids_per_frame, 3), dtype=np.float32)
+
         # Sort by frequency for consistency
         sinusoids = sorted(sinusoids, key=lambda x: x[0])
         n_sinusoids = min(len(sinusoids), max_sinusoids_per_frame)
         array[:n_sinusoids, :] = sinusoids[:n_sinusoids]
 
-    return array
+        frame_data[frame_idx] = array
+
+    return frame_data
 
 
 def find_stem_h5(data_dir, stem_name):
@@ -109,28 +112,54 @@ def find_stem_h5(data_dir, stem_name):
     return []
 
 
-def merge_stem_arrays(h5_files, frame_idx, max_sinusoids_per_frame):
-    """Merge sinusoids from multiple HDF5 files (e.g., drums_1, drums_2, ...)"""
-    merged_array = np.zeros((max_sinusoids_per_frame, 3), dtype=np.float32)
+def merge_multiple_h5_files(h5_files, max_sinusoids_per_frame):
+    """
+    Merge sinusoids from multiple HDF5 files (e.g., drums_1, drums_2, ...).
 
-    all_sinusoids = []
+    Returns:
+        dict: frame_idx -> merged array
+    """
+    # Load all files
+    all_frame_data = []
     for h5_file in h5_files:
-        file_array = get_sinusoids_for_frame(h5_file, frame_idx, max_sinusoids_per_frame)
-        # Extract non-zero sinusoids
-        non_zero_mask = file_array[:, 0] > 0
-        all_sinusoids.extend(file_array[non_zero_mask].tolist())
+        frame_data = load_all_frames_from_h5(h5_file, max_sinusoids_per_frame)
+        all_frame_data.append(frame_data)
 
-    # Fill merged array
-    if all_sinusoids:
-        all_sinusoids = sorted(all_sinusoids, key=lambda x: x[0])
-        n_sinusoids = min(len(all_sinusoids), max_sinusoids_per_frame)
-        merged_array[:n_sinusoids, :] = all_sinusoids[:n_sinusoids]
+    if not all_frame_data:
+        return {}
 
-    return merged_array
+    # Get all unique frame indices
+    all_frame_indices = set()
+    for frame_data in all_frame_data:
+        all_frame_indices.update(frame_data.keys())
+
+    # Merge frames
+    merged_frames = {}
+    for frame_idx in all_frame_indices:
+        all_sinusoids = []
+
+        # Collect sinusoids from all files for this frame
+        for frame_data in all_frame_data:
+            if frame_idx in frame_data:
+                file_array = frame_data[frame_idx]
+                # Extract non-zero sinusoids
+                non_zero_mask = file_array[:, 0] > 0
+                all_sinusoids.extend(file_array[non_zero_mask].tolist())
+
+        # Create merged array
+        merged_array = np.zeros((max_sinusoids_per_frame, 3), dtype=np.float32)
+        if all_sinusoids:
+            all_sinusoids = sorted(all_sinusoids, key=lambda x: x[0])
+            n_sinusoids = min(len(all_sinusoids), max_sinusoids_per_frame)
+            merged_array[:n_sinusoids, :] = all_sinusoids[:n_sinusoids]
+
+        merged_frames[frame_idx] = merged_array
+
+    return merged_frames
 
 
 def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
-    """Preprocess all frames in a data directory"""
+    """Preprocess all frames in a data directory (FAST: loads HDF5 once per file)"""
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
 
@@ -143,40 +172,49 @@ def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
         print(f"Skipping {data_dir}: no fullmix found")
         return []
 
-    # Determine number of frames
-    with h5py.File(fullmix_h5, 'r') as f:
-        if 'c0' not in f or 'i' not in f['c0']:
-            print(f"Skipping {data_dir}: invalid fullmix")
-            return []
-        max_frame = f['c0']['i'][:].max() if len(f['c0']['i']) > 0 else 0
+    print(f"\n{data_dir.name}: Loading fullmix...")
 
-    n_frames = int(max_frame) + 1
-    print(f"\n{data_dir.name}: {n_frames} frames")
+    # Load ALL fullmix frames at once (much faster!)
+    fullmix_frames = load_all_frames_from_h5(fullmix_h5, max_sinusoids)
+
+    if not fullmix_frames:
+        print(f"Skipping {data_dir}: no frames in fullmix")
+        return []
+
+    n_frames = max(fullmix_frames.keys()) + 1
+    print(f"{data_dir.name}: {n_frames} frames, loading stems...")
+
+    # Load ALL stem frames at once (one load per stem)
+    stem_frame_data = []
+    for stem_name in tqdm(stem_names, desc=f"Loading stems for {data_dir.name}"):
+        h5_files = find_stem_h5(data_dir, stem_name)
+
+        if len(h5_files) > 1:
+            # Merge multiple files (e.g., drums)
+            stem_frames = merge_multiple_h5_files(h5_files, max_sinusoids)
+        elif len(h5_files) == 1:
+            stem_frames = load_all_frames_from_h5(h5_files[0], max_sinusoids)
+        else:
+            stem_frames = {}
+
+        stem_frame_data.append(stem_frames)
 
     # Create output directory
     data_output_dir = output_dir / data_dir.name
     data_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Process each frame
+    # Save all frames
+    print(f"{data_dir.name}: Saving {n_frames} frames...")
     processed_frames = []
 
-    for frame_idx in tqdm(range(n_frames), desc=f"Processing {data_dir.name}"):
-        # Get fullmix sinusoids for this frame
-        fullmix_array = get_sinusoids_for_frame(fullmix_h5, frame_idx, max_sinusoids)
+    for frame_idx in tqdm(range(n_frames), desc=f"Saving {data_dir.name}"):
+        # Get fullmix for this frame (or zeros if not present)
+        fullmix_array = fullmix_frames.get(frame_idx, np.zeros((max_sinusoids, 3), dtype=np.float32))
 
-        # Get each stem's sinusoids for this frame
+        # Get each stem for this frame
         stem_arrays = []
-        for stem_name in stem_names:
-            h5_files = find_stem_h5(data_dir, stem_name)
-
-            if len(h5_files) > 1:
-                # Merge multiple files (e.g., drums)
-                stem_array = merge_stem_arrays(h5_files, frame_idx, max_sinusoids)
-            elif len(h5_files) == 1:
-                stem_array = get_sinusoids_for_frame(h5_files[0], frame_idx, max_sinusoids)
-            else:
-                stem_array = np.zeros((max_sinusoids, 3), dtype=np.float32)
-
+        for stem_frames in stem_frame_data:
+            stem_array = stem_frames.get(frame_idx, np.zeros((max_sinusoids, 3), dtype=np.float32))
             stem_arrays.append(stem_array)
 
         # Stack stems: (n_stems, max_sinusoids, 3)
