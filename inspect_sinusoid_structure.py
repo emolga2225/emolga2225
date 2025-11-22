@@ -57,28 +57,44 @@ def inspect_h5_structure(h5_path):
                     is_sorted = np.all(frames[:-1] <= frames[1:])
                     print(f"  Frames are sorted: {is_sorted}")
 
-            # Sample first track to understand organization
+            # Sample first few tracks to understand organization
             if 'len' in grp and len(grp['len']) > 0:
-                print(f"\n  First track (length={track_lens[0]}):")
-                first_track_freqs = frequencies[:track_lens[0]]
-                first_track_frames = frames[:track_lens[0]]
+                # Also check for phases
+                has_phases = 'p' in grp
+                if has_phases:
+                    phases = grp['p'][:]
+                    print(f"  Phase array shape: {phases.shape}")
 
-                print(f"    Frequencies: {first_track_freqs[:10]}")
-                print(f"    Frames: {first_track_frames[:10]}")
+                # Analyze first 5 tracks
+                offset = 0
+                for track_idx in range(min(5, len(track_lens))):
+                    track_len = track_lens[track_idx]
+                    track_freqs = frequencies[offset:offset + track_len]
+                    track_frames = frames[offset:offset + track_len]
+                    track_amps = amplitudes[offset:offset + track_len]
 
-                # Are sinusoids in this track sorted by frame?
-                is_sorted_by_frame = np.all(first_track_frames[:-1] <= first_track_frames[1:])
-                print(f"    Sorted by frame: {is_sorted_by_frame}")
+                    print(f"\n  Track {track_idx} (length={track_len}):")
+                    print(f"    Frame range: {track_frames.min()} - {track_frames.max()}")
+                    print(f"    Freq range: {track_freqs.min():.1f} - {track_freqs.max():.1f} Hz")
+                    print(f"    Freq std dev: {track_freqs.std():.2f} Hz")
+                    print(f"    Freq mean: {track_freqs.mean():.1f} Hz")
+                    print(f"    Amp range: {track_amps.min():.6f} - {track_amps.max():.6f}")
 
-                # Or sorted by frequency?
-                is_sorted_by_freq = np.all(first_track_freqs[:-1] <= first_track_freqs[1:])
-                print(f"    Sorted by frequency: {is_sorted_by_freq}")
+                    # Check if frequency is stable or varying
+                    if track_freqs.std() < 5.0:
+                        print(f"    -> STABLE frequency track (~{track_freqs.mean():.1f} Hz)")
+                    else:
+                        print(f"    -> VARYING frequency track ({track_freqs.std():.1f} Hz variation)")
 
-                # Check if it's one frequency over time
-                unique_freqs_in_track = len(np.unique(first_track_freqs))
-                print(f"    Unique frequencies in track: {unique_freqs_in_track}")
-                if unique_freqs_in_track <= 3:
-                    print(f"    Track appears to follow ONE frequency over time!")
+                    # Check frame ordering
+                    is_sorted_by_frame = np.all(track_frames[:-1] <= track_frames[1:])
+                    print(f"    Sorted by frame: {is_sorted_by_frame}")
+
+                    offset += track_len
+
+                    if track_idx == 0:
+                        print(f"    First 10 freqs: {track_freqs[:10]}")
+                        print(f"    First 10 frames: {track_frames[:10]}")
 
 # Check vocals file
 vocals_h5 = Path('ajfa/vocals_tracks.h5')
