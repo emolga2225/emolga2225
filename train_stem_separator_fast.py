@@ -24,10 +24,11 @@ import json
 
 
 class PreprocessedSinusoidDataset(Dataset):
-    """Fast dataset that loads preprocessed numpy arrays"""
+    """Fast dataset that loads preprocessed numpy arrays with multi-frame chunk support"""
 
-    def __init__(self, preprocessed_dir):
+    def __init__(self, preprocessed_dir, chunk_frames=1):
         self.preprocessed_dir = Path(preprocessed_dir)
+        self.chunk_frames = chunk_frames
 
         # Load index
         index_file = self.preprocessed_dir / 'index.json'
@@ -38,23 +39,51 @@ class PreprocessedSinusoidDataset(Dataset):
         self.stem_names = self.index['stem_names']
         self.max_sinusoids = self.index['max_sinusoids']
 
+        # Group frames by data_dir for multi-frame chunking
+        self.chunks = []
+        frames_by_dir = {}
+        for frame in self.frames:
+            data_dir = frame['data_dir']
+            if data_dir not in frames_by_dir:
+                frames_by_dir[data_dir] = []
+            frames_by_dir[data_dir].append(frame)
+
+        # Create chunks from consecutive frames
+        for data_dir, dir_frames in frames_by_dir.items():
+            # Sort by frame index
+            dir_frames.sort(key=lambda x: x['frame_idx'])
+
+            # Create chunks of consecutive frames
+            for i in range(0, len(dir_frames), chunk_frames):
+                chunk_frames_list = dir_frames[i:i + chunk_frames]
+                # Only include full chunks (or last partial chunk)
+                if len(chunk_frames_list) == chunk_frames or i + chunk_frames >= len(dir_frames):
+                    self.chunks.append(chunk_frames_list)
+
         print(f"Loaded preprocessed dataset: {len(self.frames):,} frames")
+        print(f"Organized into {len(self.chunks):,} chunks of {chunk_frames} frame(s) each")
 
     def __len__(self):
-        return len(self.frames)
+        return len(self.chunks)
 
     def __getitem__(self, idx):
-        frame_info = self.frames[idx]
-        frame_file = self.preprocessed_dir / frame_info['file']
+        chunk_frames_list = self.chunks[idx]
 
-        # Load preprocessed arrays
-        data = np.load(frame_file)
-        fullmix = data['fullmix']  # (max_sinusoids, 3)
-        stems = data['stems']      # (n_stems, max_sinusoids, 3)
+        # Load all frames in this chunk
+        fullmix_frames = []
+        stem_frames = []
 
-        # Add frame dimension: (1, max_sinusoids, 3) and (n_stems, 1, max_sinusoids, 3)
-        fullmix = fullmix[np.newaxis, :, :]  # (1, max_sinusoids, 3)
-        stems = stems[:, np.newaxis, :, :]   # (n_stems, 1, max_sinusoids, 3)
+        for frame_info in chunk_frames_list:
+            frame_file = self.preprocessed_dir / frame_info['file']
+
+            # Load preprocessed arrays
+            data = np.load(frame_file)
+            fullmix_frames.append(data['fullmix'])  # (max_sinusoids, 3)
+            stem_frames.append(data['stems'])      # (n_stems, max_sinusoids, 3)
+
+        # Stack frames: (n_frames, max_sinusoids, 3) and (n_stems, n_frames, max_sinusoids, 3)
+        fullmix = np.stack(fullmix_frames, axis=0)  # (n_frames, max_sinusoids, 3)
+        stems = np.stack(stem_frames, axis=1)       # (n_stems, n_frames, max_sinusoids, 3)
 
         return (
             torch.from_numpy(fullmix),
@@ -106,54 +135,77 @@ class TransformerStemSeparator(nn.Module):
         """
         x: (batch, n_frames, max_sinusoids, 3)
         returns: (batch, n_stems, n_frames, max_sinusoids, 3)
+
+        With multi-frame chunks, process all frames together for temporal context!
         """
         batch_size, n_frames, max_sines, _ = x.shape
 
-        # Process each frame independently to avoid huge sequence length
-        # With n_frames=1, this is just one iteration!
-        all_stem_preds = []
+        if n_frames == 1:
+            # Single frame: process efficiently
+            frame_sines = x[:, 0, :, :]  # (batch, max_sinusoids, 3)
 
-        for frame_idx in range(n_frames):
-            # Get sinusoids for this frame: (batch, max_sinusoids, 3)
-            frame_sines = x[:, frame_idx, :, :]
-
-            # Embed sinusoids: (batch, max_sinusoids, d_model)
+            # Embed sinusoids
             frame_embed = self.sinusoid_embed(frame_sines)
-
-            # Add positional encoding
             frame_embed = frame_embed + self.sinusoid_pos_embed
 
-            # Create padding mask (freq == 0 means padded)
-            padding_mask = (frame_sines[:, :, 0] == 0)  # (batch, max_sinusoids)
+            # Padding mask
+            padding_mask = (frame_sines[:, :, 0] == 0)
 
-            # Transformer for THIS FRAME
-            # Sequence length = max_sinusoids (e.g., 2000), not n_frames * max_sinusoids!
+            # Transformer
             encoded = self.transformer(frame_embed, src_key_padding_mask=padding_mask)
-            # Shape: (batch, max_sinusoids, d_model)
 
-            # Generate predictions for each stem
-            frame_stem_preds = []
+            # Predict for each stem
+            stem_preds = []
             for stem_idx in range(self.n_stems):
-                stem_output = self.output_heads[stem_idx](encoded)  # (batch, max_sines, 3)
+                stem_output = self.output_heads[stem_idx](encoded)
 
-                # Apply constraints:
-                # - Frequency: keep positive, scale to reasonable range (0-22050 Hz)
-                # - Amplitude: non-negative
-                # - Phase: wrap to [-pi, pi]
                 freq = F.relu(stem_output[:, :, 0]) * 22050 / 100
                 amp = F.relu(stem_output[:, :, 1])
                 phase = torch.atan2(torch.sin(stem_output[:, :, 2]),
                                    torch.cos(stem_output[:, :, 2]))
 
                 stem_prediction = torch.stack([freq, amp, phase], dim=-1)
-                frame_stem_preds.append(stem_prediction)
+                stem_preds.append(stem_prediction)
 
-            # Stack stems: (batch, n_stems, max_sinusoids, 3)
-            frame_stem_preds = torch.stack(frame_stem_preds, dim=1)
-            all_stem_preds.append(frame_stem_preds)
+            # Stack and add frame dimension
+            output = torch.stack(stem_preds, dim=1).unsqueeze(2)  # (batch, n_stems, 1, max_sines, 3)
 
-        # Stack frames: (batch, n_stems, n_frames, max_sinusoids, 3)
-        output = torch.stack(all_stem_preds, dim=2)
+        else:
+            # Multi-frame: flatten all frames into one sequence for temporal context!
+            # Reshape: (batch, n_frames, max_sinusoids, 3) -> (batch, n_frames * max_sinusoids, 3)
+            x_flat = x.reshape(batch_size, n_frames * max_sines, 3)
+
+            # Embed sinusoids
+            x_embed = self.sinusoid_embed(x_flat)
+
+            # Add positional encodings (tile for each frame)
+            pos_embed = self.sinusoid_pos_embed.repeat(1, n_frames, 1)
+            x_embed = x_embed + pos_embed
+
+            # Create padding mask
+            padding_mask = (x_flat[:, :, 0] == 0)
+
+            # Transformer on full sequence (provides temporal context!)
+            encoded = self.transformer(x_embed, src_key_padding_mask=padding_mask)
+
+            # Reshape back: (batch, n_frames * max_sinusoids, d_model) -> (batch, n_frames, max_sinusoids, d_model)
+            encoded = encoded.reshape(batch_size, n_frames, max_sines, self.d_model)
+
+            # Predict for each stem
+            stem_preds = []
+            for stem_idx in range(self.n_stems):
+                stem_output = self.output_heads[stem_idx](encoded)  # (batch, n_frames, max_sines, 3)
+
+                freq = F.relu(stem_output[:, :, :, 0]) * 22050 / 100
+                amp = F.relu(stem_output[:, :, :, 1])
+                phase = torch.atan2(torch.sin(stem_output[:, :, :, 2]),
+                                   torch.cos(stem_output[:, :, :, 2]))
+
+                stem_prediction = torch.stack([freq, amp, phase], dim=-1)
+                stem_preds.append(stem_prediction)
+
+            # Stack stems: (batch, n_stems, n_frames, max_sinusoids, 3)
+            output = torch.stack(stem_preds, dim=1)
 
         return output
 
@@ -205,8 +257,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--preprocessed-dir', required=True,
                        help='Directory containing preprocessed arrays (from preprocess_hdf5_to_arrays.py)')
+    parser.add_argument('--chunk-duration', type=float, default=None,
+                       help='Duration of each chunk in seconds (default: None = 1 frame). Try 0.046 for 4 frames.')
     parser.add_argument('--batch-size', type=int, default=32,
-                       help='Batch size (can be much larger with preprocessed data)')
+                       help='Batch size (reduce if using multi-frame chunks)')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
                        help='Accumulate gradients over N steps')
     parser.add_argument('--mixed-precision', action='store_true',
@@ -224,8 +278,16 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
+    # Calculate chunk frames
+    if args.chunk_duration is None:
+        chunk_frames = 1
+        print("\nUsing 1 frame per chunk")
+    else:
+        chunk_frames = int(args.chunk_duration * 44100 / 512)
+        print(f"\nUsing {chunk_frames} frames per chunk ({args.chunk_duration}s)")
+
     # Dataset
-    dataset = PreprocessedSinusoidDataset(args.preprocessed_dir)
+    dataset = PreprocessedSinusoidDataset(args.preprocessed_dir, chunk_frames=chunk_frames)
 
     dataloader = DataLoader(
         dataset,
@@ -247,19 +309,24 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Data: {len(dataset):,} frames")
+    print(f"Data: {len(dataset):,} chunks ({chunk_frames} frame(s) each)")
     print(f"Stems: {dataset.stem_names}")
-    print(f"Max sinusoids: {dataset.max_sinusoids}")
+    print(f"Max sinusoids per frame: {dataset.max_sinusoids}")
 
     # Show attention matrix size
-    seq_len = dataset.max_sinusoids
+    seq_len = dataset.max_sinusoids * chunk_frames
     attn_elements = seq_len * seq_len
     attn_mb = (attn_elements * 4) / (1024**2)
-    print(f"\nAttention matrix per frame:")
-    print(f"  Sequence length: {seq_len:,}")
-    print(f"  Memory: {attn_mb:.1f} MB")
+    attn_gb = attn_mb / 1024
+    print(f"\nAttention matrix size:")
+    print(f"  Sequence length: {seq_len:,} ({chunk_frames} frames × {dataset.max_sinusoids} sinusoids)")
+    if attn_gb < 1:
+        print(f"  Memory: {attn_mb:.1f} MB")
+    else:
+        print(f"  Memory: {attn_gb:.2f} GB")
 
     print(f"\nTraining configuration:")
+    print(f"  Chunk frames: {chunk_frames}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
