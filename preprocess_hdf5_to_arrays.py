@@ -159,7 +159,7 @@ def merge_multiple_h5_files(h5_files, max_sinusoids_per_frame):
 
 
 def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
-    """Preprocess all frames in a data directory (FAST: loads HDF5 once per file)"""
+    """Preprocess all frames in a data directory (loads one stem at a time to save memory)"""
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
 
@@ -174,7 +174,7 @@ def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
 
     print(f"\n{data_dir.name}: Loading fullmix...")
 
-    # Load ALL fullmix frames at once (much faster!)
+    # Load ALL fullmix frames at once
     fullmix_frames = load_all_frames_from_h5(fullmix_h5, max_sinusoids)
 
     if not fullmix_frames:
@@ -182,11 +182,20 @@ def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
         return []
 
     n_frames = max(fullmix_frames.keys()) + 1
-    print(f"{data_dir.name}: {n_frames} frames, loading stems...")
+    print(f"{data_dir.name}: {n_frames} frames")
 
-    # Load ALL stem frames at once (one load per stem)
-    stem_frame_data = []
-    for stem_name in tqdm(stem_names, desc=f"Loading stems for {data_dir.name}"):
+    # Create output directory
+    data_output_dir = output_dir / data_dir.name
+    data_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize arrays to hold all stems for all frames
+    # Shape: (n_frames, n_stems, max_sinusoids, 3)
+    all_stems = np.zeros((n_frames, len(stem_names), max_sinusoids, 3), dtype=np.float32)
+
+    # Process stems ONE AT A TIME to save memory
+    for stem_idx, stem_name in enumerate(stem_names):
+        print(f"{data_dir.name}: Loading {stem_name}...")
+
         h5_files = find_stem_h5(data_dir, stem_name)
 
         if len(h5_files) > 1:
@@ -197,28 +206,27 @@ def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
         else:
             stem_frames = {}
 
-        stem_frame_data.append(stem_frames)
+        # Fill in this stem's data for all frames
+        for frame_idx in range(n_frames):
+            all_stems[frame_idx, stem_idx, :, :] = stem_frames.get(
+                frame_idx,
+                np.zeros((max_sinusoids, 3), dtype=np.float32)
+            )
 
-    # Create output directory
-    data_output_dir = output_dir / data_dir.name
-    data_output_dir.mkdir(parents=True, exist_ok=True)
+        # Release memory for this stem
+        del stem_frames
+        print(f"{data_dir.name}: {stem_name} loaded")
 
     # Save all frames
     print(f"{data_dir.name}: Saving {n_frames} frames...")
     processed_frames = []
 
     for frame_idx in tqdm(range(n_frames), desc=f"Saving {data_dir.name}"):
-        # Get fullmix for this frame (or zeros if not present)
+        # Get fullmix for this frame
         fullmix_array = fullmix_frames.get(frame_idx, np.zeros((max_sinusoids, 3), dtype=np.float32))
 
-        # Get each stem for this frame
-        stem_arrays = []
-        for stem_frames in stem_frame_data:
-            stem_array = stem_frames.get(frame_idx, np.zeros((max_sinusoids, 3), dtype=np.float32))
-            stem_arrays.append(stem_array)
-
-        # Stack stems: (n_stems, max_sinusoids, 3)
-        stem_arrays = np.stack(stem_arrays, axis=0)
+        # Get all stems for this frame
+        stem_arrays = all_stems[frame_idx]  # (n_stems, max_sinusoids, 3)
 
         # Save this frame
         frame_file = data_output_dir / f'frame_{frame_idx:06d}.npz'
@@ -233,6 +241,10 @@ def preprocess_data_dir(data_dir, output_dir, stem_names, max_sinusoids):
             'file': str(frame_file.relative_to(output_dir)),
             'data_dir': data_dir.name
         })
+
+    # Clean up
+    del fullmix_frames
+    del all_stems
 
     return processed_frames
 
