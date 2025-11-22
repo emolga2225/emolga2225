@@ -209,14 +209,16 @@ class TransformerStemSeparator(nn.Module):
     """
     Transformer-based stem separator that processes exact frequencies.
 
+    MEMORY-EFFICIENT: Works best with 1 frame per chunk!
+    - With 1 frame: sequence length = max_sinusoids (e.g., 2000)
+    - Attention matrix: 2000 × 2000 = 16 MB (fits easily!)
+
     Input: (batch, n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]
     Output: (batch, n_stems, n_frames, max_sinusoids, 3)
-
-    Uses attention to learn which sinusoids belong to which stems.
     """
 
-    def __init__(self, n_stems=5, max_sinusoids=500, d_model=256, nhead=8,
-                 num_layers=6, dim_feedforward=1024):
+    def __init__(self, n_stems=5, max_sinusoids=2000, d_model=128, nhead=4,
+                 num_layers=4, dim_feedforward=512):
         super().__init__()
         self.n_stems = n_stems
         self.max_sinusoids = max_sinusoids
@@ -225,10 +227,7 @@ class TransformerStemSeparator(nn.Module):
         # Embed each sinusoid [freq, amp, phase] -> d_model dimensions
         self.sinusoid_embed = nn.Linear(3, d_model)
 
-        # Positional encoding for time frames
-        self.frame_pos_embed = nn.Parameter(torch.randn(1, 10000, d_model))
-
-        # Positional encoding for sinusoid index
+        # Positional encoding for sinusoid index (not needed for frequency since it's in the input!)
         self.sinusoid_pos_embed = nn.Parameter(torch.randn(1, max_sinusoids, d_model))
 
         # Transformer encoder
@@ -253,51 +252,52 @@ class TransformerStemSeparator(nn.Module):
         """
         batch_size, n_frames, max_sines, _ = x.shape
 
-        # Reshape to (batch, n_frames * max_sinusoids, 3)
-        x_flat = x.view(batch_size, n_frames * max_sines, 3)
+        # Process each frame independently to avoid huge sequence length
+        # With n_frames=1, this is just one iteration!
+        all_stem_preds = []
 
-        # Embed sinusoids: (batch, n_frames * max_sinusoids, d_model)
-        x_embed = self.sinusoid_embed(x_flat)
+        for frame_idx in range(n_frames):
+            # Get sinusoids for this frame: (batch, max_sinusoids, 3)
+            frame_sines = x[:, frame_idx, :, :]
 
-        # Add positional encodings
-        # Frame position encoding (repeat for each sinusoid)
-        frame_pos = self.frame_pos_embed[:, :n_frames, :].repeat(1, 1, max_sines).view(1, n_frames * max_sines, self.d_model)
+            # Embed sinusoids: (batch, max_sinusoids, d_model)
+            frame_embed = self.sinusoid_embed(frame_sines)
 
-        # Sinusoid position encoding (tile for each frame)
-        sinusoid_pos = self.sinusoid_pos_embed[:, :max_sines, :].repeat(1, n_frames, 1)
+            # Add positional encoding
+            frame_embed = frame_embed + self.sinusoid_pos_embed
 
-        x_embed = x_embed + frame_pos + sinusoid_pos
+            # Create padding mask (freq == 0 means padded)
+            padding_mask = (frame_sines[:, :, 0] == 0)  # (batch, max_sinusoids)
 
-        # Create attention mask (ignore padded sinusoids where freq=0)
-        # mask shape: (batch, n_frames * max_sinusoids)
-        freq_values = x_flat[:, :, 0]  # (batch, n_frames * max_sinusoids)
-        padding_mask = (freq_values == 0)  # True for padded positions
+            # Transformer for THIS FRAME
+            # Sequence length = max_sinusoids (e.g., 2000), not n_frames * max_sinusoids!
+            encoded = self.transformer(frame_embed, src_key_padding_mask=padding_mask)
+            # Shape: (batch, max_sinusoids, d_model)
 
-        # Transformer encoding
-        encoded = self.transformer(x_embed, src_key_padding_mask=padding_mask)
+            # Generate predictions for each stem
+            frame_stem_preds = []
+            for stem_idx in range(self.n_stems):
+                stem_output = self.output_heads[stem_idx](encoded)  # (batch, max_sines, 3)
 
-        # Reshape back to (batch, n_frames, max_sinusoids, d_model)
-        encoded = encoded.view(batch_size, n_frames, max_sines, self.d_model)
+                # Apply constraints:
+                # - Frequency: keep positive, scale to reasonable range (0-22050 Hz)
+                # - Amplitude: non-negative
+                # - Phase: wrap to [-pi, pi]
+                freq = F.relu(stem_output[:, :, 0]) * 22050 / 100  # Scale from activation
+                amp = F.relu(stem_output[:, :, 1])
+                phase = torch.atan2(torch.sin(stem_output[:, :, 2]),
+                                   torch.cos(stem_output[:, :, 2]))
 
-        # Generate predictions for each stem
-        stem_predictions = []
-        for stem_idx in range(self.n_stems):
-            stem_output = self.output_heads[stem_idx](encoded)  # (batch, n_frames, max_sines, 3)
+                stem_prediction = torch.stack([freq, amp, phase], dim=-1)
+                frame_stem_preds.append(stem_prediction)
 
-            # Apply constraints:
-            # - Frequency: keep positive, scale to reasonable range (0-22050 Hz)
-            # - Amplitude: non-negative
-            # - Phase: wrap to [-pi, pi]
-            freq = F.relu(stem_output[:, :, :, 0]) * 22050 / 100  # Scale from activation
-            amp = F.relu(stem_output[:, :, :, 1])
-            phase = torch.atan2(torch.sin(stem_output[:, :, :, 2]),
-                               torch.cos(stem_output[:, :, :, 2]))
+            # Stack stems: (batch, n_stems, max_sinusoids, 3)
+            frame_stem_preds = torch.stack(frame_stem_preds, dim=1)
+            all_stem_preds.append(frame_stem_preds)
 
-            stem_prediction = torch.stack([freq, amp, phase], dim=-1)
-            stem_predictions.append(stem_prediction)
-
-        # Stack: (batch, n_stems, n_frames, max_sinusoids, 3)
-        output = torch.stack(stem_predictions, dim=1)
+        # Stack frames: (batch, n_stems, n_frames, max_sinusoids, 3)
+        # Note: with n_frames=1, this just adds a dimension
+        output = torch.stack(all_stem_preds, dim=2)
 
         return output
 
@@ -355,28 +355,37 @@ def main():
     parser.add_argument('--data-dirs', nargs='+', required=True)
     parser.add_argument('--stem-names', nargs='+',
                        default=['vocals', 'guitar', 'bass', 'drums', 'song'])
-    parser.add_argument('--chunk-duration', type=float, default=1.0,
-                       help='Duration of each chunk in seconds (default: 1.0 for memory efficiency)')
+    parser.add_argument('--chunk-duration', type=float, default=None,
+                       help='Duration of each chunk in seconds (default: None = 1 frame per chunk)')
     parser.add_argument('--max-sinusoids', type=int, default=2000,
                        help='Max sinusoids per frame (will truncate/pad). Use inspect_max_sinusoids.py to find optimal value.')
-    parser.add_argument('--batch-size', type=int, default=1,
-                       help='Actual batch size (keep small for memory, use gradient-accumulation for larger effective batch)')
+    parser.add_argument('--batch-size', type=int, default=8,
+                       help='Batch size (can be larger with 1-frame chunks)')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
                        help='Accumulate gradients over N steps (effective batch = batch-size * N)')
     parser.add_argument('--mixed-precision', action='store_true',
                        help='Use mixed precision (fp16) training to reduce memory')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--d-model', type=int, default=256)
-    parser.add_argument('--nhead', type=int, default=8)
-    parser.add_argument('--num-layers', type=int, default=6)
+    parser.add_argument('--d-model', type=int, default=128,
+                       help='Model dimension (reduced for 1-frame chunks)')
+    parser.add_argument('--nhead', type=int, default=4,
+                       help='Number of attention heads')
+    parser.add_argument('--num-layers', type=int, default=4,
+                       help='Number of transformer layers')
     args = parser.parse_args()
 
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    chunk_frames = int(args.chunk_duration * 44100 / 512)
+    # Use 1 frame per chunk if not specified (MUCH more memory efficient!)
+    if args.chunk_duration is None:
+        chunk_frames = 1
+        print("\nUsing 1 frame per chunk (most memory efficient)")
+    else:
+        chunk_frames = int(args.chunk_duration * 44100 / 512)
+        print(f"\nUsing {chunk_frames} frames per chunk ({args.chunk_duration}s)")
 
     # Dataset
     dataset = ExactFreqSinusoidDataset(
@@ -408,8 +417,18 @@ def main():
     print(f"Data representation: ({chunk_frames} frames, {args.max_sinusoids} sinusoids/frame, 3 features)")
     print(f"Features per sinusoid: [exact_freq_Hz, amplitude, phase_radians]")
     print(f"Stems: {args.stem_names}")
+
+    # Show attention matrix size
+    seq_len = args.max_sinusoids  # With per-frame processing
+    attn_elements = seq_len * seq_len
+    attn_mb = (attn_elements * 4) / (1024**2)  # fp32
+    print(f"\nAttention matrix per frame:")
+    print(f"  Sequence length: {seq_len:,}")
+    print(f"  Attention matrix: {seq_len:,} × {seq_len:,} = {attn_elements:,} elements")
+    print(f"  Memory: {attn_mb:.1f} MB (vs 881 GB with flattened approach!)")
+
     print(f"\nMemory optimizations:")
-    print(f"  Chunk duration: {args.chunk_duration}s ({chunk_frames} frames)")
+    print(f"  Frames per chunk: {chunk_frames}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps} steps")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
