@@ -23,17 +23,20 @@ This is perfect for a 2D representation!
 
 **From:** Variable-length list of sinusoids
 ```
-[freq1, amp1, frame1]
-[freq2, amp2, frame2]
+[freq1, amp1, phase1, frame1]
+[freq2, amp2, phase2, frame2]
 ...
-[freq_52M, amp_52M, frame_52M]
+[freq_52M, amp_52M, phase_52M, frame_52M]
 ```
 
-**To:** Fixed-size 2D grid
+**To:** Fixed-size 2D grid with 2 channels
 ```
-Grid shape: (frequency_bins, time_frames)
-Grid[freq_bin, time_idx] = amplitude at that (frequency, time) location
+Grid shape: (2, frequency_bins, time_frames)
+Grid[0, freq_bin, time_idx] = magnitude at that (frequency, time) location
+Grid[1, freq_bin, time_idx] = phase at that (frequency, time) location
 ```
+
+**Phase handling:** When multiple sinusoids fall in the same frequency bin at the same time, they are combined as complex numbers (magnitude * e^(i*phase)), then converted back to magnitude and phase. This preserves phase coherence.
 
 ### Benefits
 

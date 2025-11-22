@@ -16,8 +16,9 @@ from scipy.io import wavfile
 
 def sinusoids_to_grid(h5_path, n_freq_bins=512, chunk_frames=344,
                      freq_min=0, freq_max=22050):
-    """Convert HDF5 sinusoids to 2D grid"""
-    grid = np.zeros((n_freq_bins, chunk_frames), dtype=np.float32)
+    """Convert HDF5 sinusoids to 2D grid with magnitude and phase"""
+    # 2 channels: magnitude and phase
+    grid = np.zeros((2, n_freq_bins, chunk_frames), dtype=np.float32)
     freq_bin_width = (freq_max - freq_min) / n_freq_bins
 
     if not h5_path.exists():
@@ -31,6 +32,7 @@ def sinusoids_to_grid(h5_path, n_freq_bins=512, chunk_frames=344,
         track_lens = grp['len'][:]
         frequencies = grp['f'][:]
         amplitudes = grp['a'][:]
+        phases = grp['p'][:] if 'p' in grp else np.zeros_like(amplitudes)
         frames = grp['i'][:]
 
         # Only take first chunk_frames
@@ -38,22 +40,36 @@ def sinusoids_to_grid(h5_path, n_freq_bins=512, chunk_frames=344,
         for track_len in track_lens:
             track_freqs = frequencies[offset:offset + track_len]
             track_amps = amplitudes[offset:offset + track_len]
+            track_phases = phases[offset:offset + track_len]
             track_frames = frames[offset:offset + track_len]
 
             # Filter to chunk range
             mask = track_frames < chunk_frames
             chunk_freqs = track_freqs[mask]
             chunk_amps = track_amps[mask]
+            chunk_phases = track_phases[mask]
             chunk_frames_local = track_frames[mask]
 
             # Add to grid
-            for freq, amp, frame in zip(chunk_freqs, chunk_amps, chunk_frames_local):
+            for freq, amp, phase, frame in zip(chunk_freqs, chunk_amps, chunk_phases, chunk_frames_local):
                 freq_bin = int((freq - freq_min) / freq_bin_width)
                 freq_bin = np.clip(freq_bin, 0, n_freq_bins - 1)
                 time_idx = int(frame)
 
                 if 0 <= time_idx < chunk_frames:
-                    grid[freq_bin, time_idx] += amp
+                    # Convert to complex for proper phase accumulation
+                    complex_val = amp * np.exp(1j * phase)
+
+                    # Accumulate complex values
+                    existing_mag = grid[0, freq_bin, time_idx]
+                    existing_phase = grid[1, freq_bin, time_idx]
+                    existing_complex = existing_mag * np.exp(1j * existing_phase)
+
+                    new_complex = existing_complex + complex_val
+
+                    # Store magnitude and phase
+                    grid[0, freq_bin, time_idx] = np.abs(new_complex)
+                    grid[1, freq_bin, time_idx] = np.angle(new_complex)
 
             offset += track_len
 
@@ -62,37 +78,39 @@ def sinusoids_to_grid(h5_path, n_freq_bins=512, chunk_frames=344,
 
 def grid_to_sinusoids(grid, freq_min=0, freq_max=22050):
     """
-    Convert 2D grid back to sinusoids.
+    Convert 2D grid with magnitude and phase back to sinusoids.
 
     For each non-zero grid cell, create a sinusoid with:
     - freq: center frequency of that bin
-    - amp: grid value
+    - amp: magnitude value
+    - phase: phase value
     - frame: time index
     """
-    n_freq_bins, n_time_frames = grid.shape
+    n_freq_bins, n_time_frames = grid.shape[1], grid.shape[2]
     freq_bin_width = (freq_max - freq_min) / n_freq_bins
 
     sinusoids = []
 
     for freq_bin in range(n_freq_bins):
         for time_idx in range(n_time_frames):
-            amp = grid[freq_bin, time_idx]
+            amp = grid[0, freq_bin, time_idx]  # magnitude
+            phase = grid[1, freq_bin, time_idx]  # phase
 
             # Only keep non-zero amplitudes
             if amp > 1e-10:
                 freq = freq_min + (freq_bin + 0.5) * freq_bin_width
-                sinusoids.append([freq, amp, time_idx])
+                sinusoids.append([freq, amp, phase, time_idx])
 
-    return np.array(sinusoids, dtype=np.float32) if sinusoids else np.zeros((0, 3), dtype=np.float32)
+    return np.array(sinusoids, dtype=np.float32) if sinusoids else np.zeros((0, 4), dtype=np.float32)
 
 
 def synthesize_audio_from_sinusoids(sinusoids, hop_length=512, sample_rate=44100,
                                    duration=None):
     """
-    Synthesize audio from sinusoids using additive synthesis.
+    Synthesize audio from sinusoids using additive synthesis with phase.
 
     Args:
-        sinusoids: Array of [freq, amp, frame] sinusoids
+        sinusoids: Array of [freq, amp, phase, frame] sinusoids
         hop_length: Hop length in samples
         sample_rate: Audio sample rate
         duration: Duration in samples (auto-detect if None)
@@ -102,14 +120,14 @@ def synthesize_audio_from_sinusoids(sinusoids, hop_length=512, sample_rate=44100
 
     # Determine audio length
     if duration is None:
-        max_frame = int(sinusoids[:, 2].max())
+        max_frame = int(sinusoids[:, 3].max())
         duration = (max_frame + 1) * hop_length
 
     audio = np.zeros(duration, dtype=np.float32)
 
     # Group sinusoids by frame for efficiency
-    for frame_idx in range(int(sinusoids[:, 2].max()) + 1):
-        frame_mask = sinusoids[:, 2] == frame_idx
+    for frame_idx in range(int(sinusoids[:, 3].max()) + 1):
+        frame_mask = sinusoids[:, 3] == frame_idx
         frame_sines = sinusoids[frame_mask]
 
         if len(frame_sines) == 0:
@@ -124,9 +142,9 @@ def synthesize_audio_from_sinusoids(sinusoids, hop_length=512, sample_rate=44100
         t = np.arange(n_samples) / sample_rate
 
         # Add all sinusoids in this frame
-        for freq, amp, _ in frame_sines:
-            # Generate sine wave
-            sine_wave = amp * np.sin(2 * np.pi * freq * t)
+        for freq, amp, phase, _ in frame_sines:
+            # Generate sine wave with phase
+            sine_wave = amp * np.sin(2 * np.pi * freq * t + phase)
             audio[start_sample:end_sample] += sine_wave
 
     # Normalize to prevent clipping
@@ -172,29 +190,31 @@ def separate_stems(fullmix_h5, checkpoint_path, output_dir):
     print(f"Model: {len(stem_names)} stems, {n_freq_bins} freq bins, {chunk_frames} time frames")
     print(f"Stems: {stem_names}")
 
-    # Convert fullmix to 2D grid
+    # Convert fullmix to 2D grid with magnitude and phase
     print("\nConverting fullmix to 2D grid...")
     fullmix_grid = sinusoids_to_grid(Path(fullmix_h5), n_freq_bins, chunk_frames)
-    print(f"Fullmix grid shape: {fullmix_grid.shape}")
-    print(f"Fullmix grid range: {fullmix_grid.min():.6f} - {fullmix_grid.max():.6f}")
+    print(f"Fullmix grid shape: {fullmix_grid.shape}")  # (2, freq_bins, time_frames)
+    print(f"Fullmix magnitude range: {fullmix_grid[0].min():.6f} - {fullmix_grid[0].max():.6f}")
+    print(f"Fullmix phase range: {fullmix_grid[1].min():.6f} - {fullmix_grid[1].max():.6f}")
 
     # Run model
     print("\nRunning model inference...")
-    fullmix_tensor = torch.from_numpy(fullmix_grid[np.newaxis, np.newaxis, :, :]).to(device)
+    fullmix_tensor = torch.from_numpy(fullmix_grid[np.newaxis, :, :, :]).to(device)  # (1, 2, H, W)
 
     with torch.no_grad():
         pred_stems = model(fullmix_tensor)
 
-    pred_stems = pred_stems.cpu().numpy()[0]  # (n_stems, freq_bins, time_frames)
+    pred_stems = pred_stems.cpu().numpy()[0]  # (n_stems, 2, freq_bins, time_frames)
     print(f"Predicted stems shape: {pred_stems.shape}")
 
     # Convert each stem grid back to sinusoids and synthesize audio
     for stem_idx, stem_name in enumerate(stem_names):
         print(f"\nProcessing {stem_name}...")
-        stem_grid = pred_stems[stem_idx]
+        stem_grid = pred_stems[stem_idx]  # (2, freq_bins, time_frames)
 
-        print(f"  Grid range: {stem_grid.min():.6f} - {stem_grid.max():.6f}")
-        print(f"  Non-zero cells: {(stem_grid > 1e-10).sum()} / {stem_grid.size}")
+        print(f"  Magnitude range: {stem_grid[0].min():.6f} - {stem_grid[0].max():.6f}")
+        print(f"  Phase range: {stem_grid[1].min():.6f} - {stem_grid[1].max():.6f}")
+        print(f"  Non-zero magnitude cells: {(stem_grid[0] > 1e-10).sum()} / {stem_grid[0].size}")
 
         # Convert to sinusoids
         stem_sinusoids = grid_to_sinusoids(stem_grid)
@@ -203,6 +223,7 @@ def separate_stems(fullmix_h5, checkpoint_path, output_dir):
         if len(stem_sinusoids) > 0:
             print(f"  Freq range: {stem_sinusoids[:, 0].min():.1f} - {stem_sinusoids[:, 0].max():.1f} Hz")
             print(f"  Amp range: {stem_sinusoids[:, 1].min():.6f} - {stem_sinusoids[:, 1].max():.6f}")
+            print(f"  Phase range: {stem_sinusoids[:, 2].min():.6f} - {stem_sinusoids[:, 2].max():.6f}")
 
         # Synthesize audio
         audio = synthesize_audio_from_sinusoids(stem_sinusoids, hop_length=512, sample_rate=44100)

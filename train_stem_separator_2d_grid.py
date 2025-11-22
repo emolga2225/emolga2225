@@ -59,8 +59,9 @@ class SinusoidalGrid2DDataset(Dataset):
         print(f"Dataset: {len(self.chunks)} chunks from {len(self.data_dirs)} directories")
 
     def sinusoids_to_grid(self, h5_path, chunk_idx):
-        """Convert sinusoids in a chunk to 2D grid"""
-        grid = np.zeros((self.n_freq_bins, self.chunk_frames), dtype=np.float32)
+        """Convert sinusoids in a chunk to 2D grid with magnitude and phase channels"""
+        # 2 channels: magnitude and phase
+        grid = np.zeros((2, self.n_freq_bins, self.chunk_frames), dtype=np.float32)
 
         if not h5_path.exists():
             return grid
@@ -76,6 +77,7 @@ class SinusoidalGrid2DDataset(Dataset):
             track_lens = grp['len'][:]
             frequencies = grp['f'][:]
             amplitudes = grp['a'][:]
+            phases = grp['p'][:] if 'p' in grp else np.zeros_like(amplitudes)
             frames = grp['i'][:]
 
             # Process each track
@@ -83,23 +85,36 @@ class SinusoidalGrid2DDataset(Dataset):
             for track_len in track_lens:
                 track_freqs = frequencies[offset:offset + track_len]
                 track_amps = amplitudes[offset:offset + track_len]
+                track_phases = phases[offset:offset + track_len]
                 track_frames = frames[offset:offset + track_len]
 
                 # Only process sinusoids in this chunk's time range
                 mask = (track_frames >= start_frame) & (track_frames < end_frame)
                 chunk_freqs = track_freqs[mask]
                 chunk_amps = track_amps[mask]
+                chunk_phases = track_phases[mask]
                 chunk_frames_local = track_frames[mask] - start_frame
 
                 # Add to grid
-                for freq, amp, frame in zip(chunk_freqs, chunk_amps, chunk_frames_local):
+                for freq, amp, phase, frame in zip(chunk_freqs, chunk_amps, chunk_phases, chunk_frames_local):
                     freq_bin = int((freq - self.freq_min) / self.freq_bin_width)
                     freq_bin = np.clip(freq_bin, 0, self.n_freq_bins - 1)
                     time_idx = int(frame)
 
                     if 0 <= time_idx < self.chunk_frames:
-                        # Accumulate amplitudes (multiple sinusoids can be in same bin)
-                        grid[freq_bin, time_idx] += amp
+                        # Convert to complex for proper phase accumulation
+                        complex_val = amp * np.exp(1j * phase)
+
+                        # Accumulate complex values (handles phase properly)
+                        existing_mag = grid[0, freq_bin, time_idx]
+                        existing_phase = grid[1, freq_bin, time_idx]
+                        existing_complex = existing_mag * np.exp(1j * existing_phase)
+
+                        new_complex = existing_complex + complex_val
+
+                        # Store magnitude and phase
+                        grid[0, freq_bin, time_idx] = np.abs(new_complex)
+                        grid[1, freq_bin, time_idx] = np.angle(new_complex)
 
                 offset += track_len
 
@@ -136,12 +151,12 @@ class SinusoidalGrid2DDataset(Dataset):
     def __getitem__(self, idx):
         data_dir, chunk_idx = self.chunks[idx]
 
-        # Load fullmix as input
+        # Load fullmix as input (2 channels: magnitude, phase)
         fullmix_h5 = data_dir / 'fullmix_tracks.h5'
         if not fullmix_h5.exists():
             fullmix_h5 = data_dir / 'fullmix.h5'
 
-        fullmix_grid = self.sinusoids_to_grid(fullmix_h5, chunk_idx)
+        fullmix_grid = self.sinusoids_to_grid(fullmix_h5, chunk_idx)  # (2, freq_bins, time_frames)
 
         # Load each stem as target
         stem_grids = []
@@ -149,18 +164,29 @@ class SinusoidalGrid2DDataset(Dataset):
             h5_files = self.find_stem_h5(data_dir, stem_name)
 
             # Merge grids if multiple files (e.g., drums)
-            stem_grid = np.zeros((self.n_freq_bins, self.chunk_frames), dtype=np.float32)
+            # Initialize with 2 channels (magnitude, phase)
+            stem_grid = np.zeros((2, self.n_freq_bins, self.chunk_frames), dtype=np.float32)
             for h5_file in h5_files:
-                stem_grid += self.sinusoids_to_grid(h5_file, chunk_idx)
+                file_grid = self.sinusoids_to_grid(h5_file, chunk_idx)
+
+                # Add complex values for proper accumulation
+                for f in range(self.n_freq_bins):
+                    for t in range(self.chunk_frames):
+                        # Convert both to complex
+                        existing = stem_grid[0, f, t] * np.exp(1j * stem_grid[1, f, t])
+                        new = file_grid[0, f, t] * np.exp(1j * file_grid[1, f, t])
+
+                        # Add and convert back
+                        combined = existing + new
+                        stem_grid[0, f, t] = np.abs(combined)
+                        stem_grid[1, f, t] = np.angle(combined)
 
             stem_grids.append(stem_grid)
 
-        # Stack stems: (n_stems, freq_bins, time_frames)
+        # Stack stems: (n_stems, 2, freq_bins, time_frames)
         stem_grids = np.stack(stem_grids, axis=0)
 
-        # Add channel dimension for fullmix: (1, freq_bins, time_frames)
-        fullmix_grid = fullmix_grid[np.newaxis, :]
-
+        # fullmix_grid already has shape (2, freq_bins, time_frames)
         return (
             torch.from_numpy(fullmix_grid),
             torch.from_numpy(stem_grids)
@@ -169,17 +195,21 @@ class SinusoidalGrid2DDataset(Dataset):
 
 class UNetStemSeparator(nn.Module):
     """
-    U-Net architecture for stem separation.
+    U-Net architecture for stem separation with magnitude and phase channels.
 
     U-Net is the standard architecture for source separation tasks.
     It has an encoder-decoder structure with skip connections.
+
+    Input: (2, freq_bins, time_frames) - magnitude and phase channels
+    Output: (n_stems, 2, freq_bins, time_frames) - magnitude and phase per stem
     """
 
     def __init__(self, n_stems=5, base_channels=32):
         super().__init__()
+        self.n_stems = n_stems
 
-        # Encoder (downsampling path)
-        self.enc1 = self.conv_block(1, base_channels)
+        # Encoder (downsampling path) - input has 2 channels (magnitude, phase)
+        self.enc1 = self.conv_block(2, base_channels)
         self.enc2 = self.conv_block(base_channels, base_channels * 2)
         self.enc3 = self.conv_block(base_channels * 2, base_channels * 4)
         self.enc4 = self.conv_block(base_channels * 4, base_channels * 8)
@@ -193,8 +223,8 @@ class UNetStemSeparator(nn.Module):
         self.dec2 = self.conv_block(base_channels * 4 + base_channels * 2, base_channels * 2)
         self.dec1 = self.conv_block(base_channels * 2 + base_channels, base_channels)
 
-        # Output layer - one grid per stem
-        self.output = nn.Conv2d(base_channels, n_stems, kernel_size=1)
+        # Output layer - 2 channels (magnitude, phase) per stem
+        self.output = nn.Conv2d(base_channels, n_stems * 2, kernel_size=1)
 
         # Pooling and upsampling
         self.pool = nn.MaxPool2d(2)
@@ -212,6 +242,8 @@ class UNetStemSeparator(nn.Module):
         )
 
     def forward(self, x):
+        # x shape: (B, 2, H, W) where 2 = (magnitude, phase)
+
         # Encoder
         e1 = self.enc1(x)  # (B, 32, H, W)
         e2 = self.enc2(self.pool(e1))  # (B, 64, H/2, W/2)
@@ -238,11 +270,19 @@ class UNetStemSeparator(nn.Module):
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
 
-        # Output: (B, n_stems, H, W)
+        # Output: (B, n_stems * 2, H, W)
         out = self.output(d1)
 
-        # Use ReLU to ensure non-negative amplitudes
-        out = F.relu(out)
+        # Reshape to (B, n_stems, 2, H, W)
+        batch_size, _, height, width = out.shape
+        out = out.view(batch_size, self.n_stems, 2, height, width)
+
+        # Apply constraints:
+        # - Magnitude (channel 0): non-negative
+        # - Phase (channel 1): wrap to [-pi, pi]
+        out[:, :, 0, :, :] = F.relu(out[:, :, 0, :, :])  # magnitude >= 0
+        out[:, :, 1, :, :] = torch.atan2(torch.sin(out[:, :, 1, :, :]),
+                                         torch.cos(out[:, :, 1, :, :]))  # phase in [-pi, pi]
 
         return out
 
