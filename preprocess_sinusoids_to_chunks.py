@@ -132,21 +132,45 @@ def preprocess_directory(data_dir, stem_names, chunk_duration=4.0, hop_length=51
     chunks_dir = data_dir / 'sinusoid_chunks'
     chunks_dir.mkdir(exist_ok=True)
 
-    # STEP 1: Process fullmix first (creates all chunk files with just fullmix)
-    print(f"  Processing fullmix...")
-    fullmix_all = load_all_sinusoids_from_h5(fullmix_h5)
+    # Check if chunks already exist
+    existing_chunks = list(chunks_dir.glob('chunk_*.npz'))
+    chunks_exist = len(existing_chunks) > 0
 
-    for chunk_idx in tqdm(range(n_chunks), desc=f"  Creating chunks"):
-        fullmix_sines = chunk_sinusoids(fullmix_all, chunk_idx, chunk_frames)
-        chunk_file = chunks_dir / f'chunk_{chunk_idx:04d}.npz'
-        np.savez_compressed(chunk_file, fullmix=fullmix_sines)
+    if chunks_exist:
+        print(f"  Found {len(existing_chunks)} existing chunks, checking for missing stems...")
+        # Check which stems are already in the chunks
+        sample_chunk = np.load(existing_chunks[0])
+        existing_stems = set(sample_chunk.files) - {'fullmix'}
+        missing_stems = set(stem_names) - existing_stems
 
-    # Clear fullmix from memory
-    del fullmix_all
-    gc.collect()
+        if missing_stems:
+            print(f"  Missing stems: {missing_stems}")
+            print(f"  Will add only missing stems to existing chunks")
+        else:
+            print(f"  All stems already present, skipping")
+            return
+    else:
+        # STEP 1: Process fullmix first (creates all chunk files with just fullmix)
+        print(f"  Processing fullmix...")
+        fullmix_all = load_all_sinusoids_from_h5(fullmix_h5)
 
-    # STEP 2: Process each stem one at a time (updates existing chunk files)
+        for chunk_idx in tqdm(range(n_chunks), desc=f"  Creating chunks"):
+            fullmix_sines = chunk_sinusoids(fullmix_all, chunk_idx, chunk_frames)
+            chunk_file = chunks_dir / f'chunk_{chunk_idx:04d}.npz'
+            np.savez_compressed(chunk_file, fullmix=fullmix_sines)
+
+        # Clear fullmix from memory
+        del fullmix_all
+        gc.collect()
+
+        missing_stems = set(stem_names)  # All stems are missing in new chunks
+
+    # STEP 2: Process each stem one at a time (only missing stems)
     for stem_name in stem_names:
+        # Skip if stem already exists in chunks
+        if chunks_exist and stem_name not in missing_stems:
+            print(f"  Skipping {stem_name} (already exists)")
+            continue
         stem_all = None
 
         # Special case: drums can be split across multiple files
