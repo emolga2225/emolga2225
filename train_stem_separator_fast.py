@@ -78,8 +78,8 @@ class PreprocessedSinusoidDataset(Dataset):
 
             # Load preprocessed arrays
             data = np.load(frame_file)
-            fullmix_frames.append(data['fullmix'])  # (max_sinusoids, 3)
-            stem_frames.append(data['stems'])      # (n_stems, max_sinusoids, 3)
+            fullmix_frames.append(data['fullmix'].copy())  # (max_sinusoids, 3)
+            stem_frames.append(data['stems'].copy())      # (n_stems, max_sinusoids, 3)
 
         # Stack frames: (n_frames, max_sinusoids, 3) and (n_stems, n_frames, max_sinusoids, 3)
         fullmix = np.stack(fullmix_frames, axis=0)  # (n_frames, max_sinusoids, 3)
