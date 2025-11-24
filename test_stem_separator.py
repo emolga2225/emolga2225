@@ -286,6 +286,8 @@ def main():
 
     parser.add_argument('--output-dir', default='separated_stems', help='Output directory for separated stems')
     parser.add_argument('--max-sinusoids', type=int, default=2000)
+    parser.add_argument('--chunk-frames', type=int, default=1,
+                       help='Frames per inference chunk (1=safest, 3=match training, 10=faster but uses more memory)')
     args = parser.parse_args()
 
     # Setup
@@ -336,16 +338,24 @@ def main():
     # Prepare for model
     sinusoids_tensor = torch.from_numpy(sinusoids).unsqueeze(0).to(device)  # (1, n_frames, max_sines, 3)
 
+    # Estimate memory usage
+    seq_len = args.chunk_frames * args.max_sinusoids
+    attn_elements = seq_len * seq_len
+    attn_gb = (attn_elements * 4) / (1024**3)
+    if attn_gb > 2.0:
+        print(f"\n⚠️  WARNING: Large attention matrix ({attn_gb:.1f} GB)")
+        print(f"   Consider reducing --chunk-frames to avoid OOM")
+        print(f"   Recommended: --chunk-frames 1 or 3")
+
     # Run model
-    print("\nSeparating stems...")
+    print(f"\nSeparating stems (processing {args.chunk_frames} frame(s) at a time)...")
     with torch.no_grad():
         # Process in chunks to avoid OOM
-        chunk_size = 100  # frames per chunk
         n_frames = sinusoids_tensor.shape[1]
         all_predictions = []
 
-        for i in tqdm(range(0, n_frames, chunk_size)):
-            chunk = sinusoids_tensor[:, i:i+chunk_size]
+        for i in tqdm(range(0, n_frames, args.chunk_frames)):
+            chunk = sinusoids_tensor[:, i:i+args.chunk_frames]
             pred = model(chunk)  # (1, n_stems, chunk_frames, max_sines, 3)
             all_predictions.append(pred.cpu())
 
