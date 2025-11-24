@@ -131,6 +131,23 @@ class TransformerStemSeparator(nn.Module):
             for _ in range(n_stems)
         ])
 
+        # Initialize weights with smaller variance for numerical stability
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with small values to prevent early NaN"""
+        # Initialize embedding layers
+        nn.init.xavier_uniform_(self.sinusoid_embed.weight, gain=0.01)
+        nn.init.zeros_(self.sinusoid_embed.bias)
+
+        # Initialize output heads with small weights
+        for head in self.output_heads:
+            nn.init.xavier_uniform_(head.weight, gain=0.01)
+            nn.init.zeros_(head.bias)
+
+        # Initialize positional embeddings
+        nn.init.normal_(self.sinusoid_pos_embed, mean=0, std=0.01)
+
     def forward(self, x):
         """
         x: (batch, n_frames, max_sinusoids, 3)
@@ -159,8 +176,9 @@ class TransformerStemSeparator(nn.Module):
             for stem_idx in range(self.n_stems):
                 stem_output = self.output_heads[stem_idx](encoded)
 
-                freq = F.relu(stem_output[:, :, 0]) * 22050 / 100
-                amp = F.relu(stem_output[:, :, 1])
+                # Clamp outputs to prevent extreme values
+                freq = torch.clamp(F.relu(stem_output[:, :, 0]) * 22050 / 100, 0, 22050)
+                amp = torch.clamp(F.relu(stem_output[:, :, 1]), 0, 100)
                 phase = torch.atan2(torch.sin(stem_output[:, :, 2]),
                                    torch.cos(stem_output[:, :, 2]))
 
@@ -196,8 +214,9 @@ class TransformerStemSeparator(nn.Module):
             for stem_idx in range(self.n_stems):
                 stem_output = self.output_heads[stem_idx](encoded)  # (batch, n_frames, max_sines, 3)
 
-                freq = F.relu(stem_output[:, :, :, 0]) * 22050 / 100
-                amp = F.relu(stem_output[:, :, :, 1])
+                # Clamp outputs to prevent extreme values
+                freq = torch.clamp(F.relu(stem_output[:, :, :, 0]) * 22050 / 100, 0, 22050)
+                amp = torch.clamp(F.relu(stem_output[:, :, :, 1]), 0, 100)
                 phase = torch.atan2(torch.sin(stem_output[:, :, :, 2]),
                                    torch.cos(stem_output[:, :, :, 2]))
 
@@ -210,7 +229,7 @@ class TransformerStemSeparator(nn.Module):
         return output
 
 
-def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_steps=1, use_amp=False):
+def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_steps=1, use_amp=False, max_grad_norm=1.0):
     """Train for one epoch with gradient accumulation and optional mixed precision"""
     model.train()
     total_loss = 0
@@ -222,13 +241,34 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
         fullmix = fullmix.to(device)
         stems = stems.to(device)
 
+        # Check for NaN/Inf in input data
+        if torch.isnan(fullmix).any() or torch.isinf(fullmix).any():
+            print(f"\nWARNING: NaN/Inf detected in input fullmix at batch {batch_idx}")
+            continue
+        if torch.isnan(stems).any() or torch.isinf(stems).any():
+            print(f"\nWARNING: NaN/Inf detected in input stems at batch {batch_idx}")
+            continue
+
         # Mixed precision context
         with torch.cuda.amp.autocast() if use_amp else torch.enable_grad():
             # Forward pass
             pred_stems = model(fullmix)
 
+            # Check for NaN/Inf in model output
+            if torch.isnan(pred_stems).any() or torch.isinf(pred_stems).any():
+                print(f"\nERROR: NaN/Inf in model output at batch {batch_idx}")
+                print(f"  fullmix range: [{fullmix.min():.4f}, {fullmix.max():.4f}]")
+                print(f"  stems range: [{stems.min():.4f}, {stems.max():.4f}]")
+                print(f"  pred_stems range: [{pred_stems.min():.4f}, {pred_stems.max():.4f}]")
+                raise ValueError("NaN/Inf detected in model output - training unstable")
+
             # L1 loss
             loss = F.l1_loss(pred_stems, stems)
+
+            # Check for NaN loss
+            if torch.isnan(loss):
+                print(f"\nERROR: NaN loss at batch {batch_idx}")
+                raise ValueError("NaN loss detected")
 
             # Scale loss for gradient accumulation
             loss = loss / gradient_accumulation_steps
@@ -242,9 +282,15 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
         # Update weights every gradient_accumulation_steps
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
             if use_amp:
+                # Unscale gradients and clip
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                # Clip gradients to prevent explosion
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
             optimizer.zero_grad()
 
@@ -272,6 +318,8 @@ def main():
     parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=4,
                        help='DataLoader workers (can use multiple with preprocessed data)')
+    parser.add_argument('--max-grad-norm', type=float, default=1.0,
+                       help='Maximum gradient norm for clipping (prevents gradient explosion)')
     args = parser.parse_args()
 
     # Setup
@@ -338,7 +386,8 @@ def main():
         loss = train_epoch(
             model, dataloader, optimizer, device,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            use_amp=args.mixed_precision
+            use_amp=args.mixed_precision,
+            max_grad_norm=args.max_grad_norm
         )
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {loss:.6f}")
 
