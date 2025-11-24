@@ -178,13 +178,35 @@ def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
     3. /c0/freqs, /c0/amps, /c0/phases (channel-based)
     4. /c0, /c1, ... (direct arrays where each is (n_frames, n_sinusoids, 3))
 
-    Returns: (n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]
+    Returns: tuple of (sinusoids, metadata)
+        sinusoids: (n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]
+        metadata: dict with 'sample_rate', 'fft_size', 'hop_size', etc. if available
     """
     print(f"Loading sinusoids from HDF5: {h5_file}")
 
     with h5py.File(h5_file, 'r') as f:
         root_keys = list(f.keys())
         print(f"Available keys in HDF5: {root_keys}")
+
+        # Try to read metadata if available
+        metadata = {}
+        if 'sr' in f.attrs:
+            metadata['sample_rate'] = int(f.attrs['sr'])
+            print(f"Found metadata: sample_rate = {metadata['sample_rate']} Hz")
+        if 'fft' in f.attrs:
+            metadata['fft_size'] = int(f.attrs['fft'])
+            print(f"Found metadata: fft_size = {metadata['fft_size']}")
+        if 'hop' in f.attrs:
+            metadata['hop_size'] = int(f.attrs['hop'])
+            print(f"Found metadata: hop_size = {metadata['hop_size']}")
+
+        # Calculate derived parameters
+        if 'fft_size' in metadata:
+            bandwidth = metadata['fft_size'] * (6000.0 / 1024.0)
+            band_sr = int(bandwidth * 2)
+            metadata['bandwidth'] = bandwidth
+            metadata['band_sr'] = band_sr
+            print(f"Calculated: bandwidth = {bandwidth:.1f} Hz, band_sr = {band_sr} Hz")
 
         # Try different possible structures
         if 'fullmix' in f:
