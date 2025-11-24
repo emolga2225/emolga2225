@@ -154,20 +154,38 @@ class TransformerStemSeparator(nn.Module):
         return output
 
 
-def load_sinusoids_from_h5(h5_file, max_sinusoids=2000):
+def explore_h5_structure(f, prefix=''):
+    """Recursively explore HDF5 structure"""
+    items = []
+    for key in f.keys():
+        path = f"{prefix}/{key}" if prefix else key
+        item = f[key]
+        if isinstance(item, h5py.Group):
+            items.append(f"GROUP: {path}/")
+            items.extend(explore_h5_structure(item, path))
+        elif isinstance(item, h5py.Dataset):
+            items.append(f"DATASET: {path} {item.shape} {item.dtype}")
+    return items
+
+
+def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
     """
     Load synchrosqueezed sinusoids from HDF5 file.
 
-    Expected HDF5 structure:
-        /fullmix/freqs: (n_frames, n_sinusoids) - frequencies in Hz
-        /fullmix/amps: (n_frames, n_sinusoids) - amplitudes
-        /fullmix/phases: (n_frames, n_sinusoids) - phases in radians
+    Supports multiple HDF5 structures:
+    1. /fullmix/freqs, /fullmix/amps, /fullmix/phases
+    2. /freqs, /amps, /phases
+    3. /c0/freqs, /c0/amps, /c0/phases (channel-based)
+    4. /c0, /c1, ... (direct arrays where each is (n_frames, n_sinusoids, 3))
 
     Returns: (n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]
     """
     print(f"Loading sinusoids from HDF5: {h5_file}")
 
     with h5py.File(h5_file, 'r') as f:
+        root_keys = list(f.keys())
+        print(f"Available keys in HDF5: {root_keys}")
+
         # Try different possible structures
         if 'fullmix' in f:
             # Structure: /fullmix/freqs, /fullmix/amps, /fullmix/phases
@@ -175,15 +193,63 @@ def load_sinusoids_from_h5(h5_file, max_sinusoids=2000):
             freqs = np.array(group['freqs'])
             amps = np.array(group['amps'])
             phases = np.array(group['phases'])
+
         elif 'freqs' in f:
             # Flat structure: /freqs, /amps, /phases
             freqs = np.array(f['freqs'])
             amps = np.array(f['amps'])
             phases = np.array(f['phases'])
+
+        elif any(k.startswith('c') for k in root_keys):
+            # Channel-based structure: /c0, /c1, etc.
+            # Check if these are groups or datasets
+            first_channel = root_keys[0]
+
+            if isinstance(f[first_channel], h5py.Group):
+                # Structure: /c0/freqs, /c0/amps, /c0/phases
+                if channel is None:
+                    channel = first_channel
+                    print(f"Multiple channels found {root_keys}, using '{channel}'")
+
+                group = f[channel]
+                if 'freqs' in group:
+                    freqs = np.array(group['freqs'])
+                    amps = np.array(group['amps'])
+                    phases = np.array(group['phases'])
+                else:
+                    print(f"\nStructure of /{channel}/:")
+                    for key in group.keys():
+                        print(f"  {key}: {group[key].shape} {group[key].dtype}")
+                    raise ValueError(f"Channel '{channel}' doesn't contain 'freqs', 'amps', 'phases'")
+
+            elif isinstance(f[first_channel], h5py.Dataset):
+                # Direct arrays: /c0, /c1 where each might be (n_frames, n_sinusoids, 3)
+                if channel is None:
+                    channel = first_channel
+                    print(f"Multiple channels found {root_keys}, using '{channel}'")
+
+                data = np.array(f[channel])
+                print(f"Dataset shape: {data.shape}, dtype: {data.dtype}")
+
+                # Check if it's already in the right format (n_frames, n_sinusoids, 3)
+                if len(data.shape) == 3 and data.shape[2] == 3:
+                    freqs = data[:, :, 0]
+                    amps = data[:, :, 1]
+                    phases = data[:, :, 2]
+                # Or maybe it's (3, n_frames, n_sinusoids)
+                elif len(data.shape) == 3 and data.shape[0] == 3:
+                    freqs = data[0]
+                    amps = data[1]
+                    phases = data[2]
+                else:
+                    raise ValueError(f"Unexpected dataset shape: {data.shape}. Expected (n_frames, n_sinusoids, 3) or (3, n_frames, n_sinusoids)")
+
         else:
-            # List available keys for debugging
-            print(f"Available keys in HDF5: {list(f.keys())}")
-            raise ValueError("Could not find sinusoid data in HDF5. Expected 'fullmix' group or 'freqs' dataset.")
+            # Unknown structure - print full exploration
+            print("\nFull HDF5 structure:")
+            for line in explore_h5_structure(f):
+                print(f"  {line}")
+            raise ValueError("Could not find sinusoid data in HDF5. See structure above.")
 
     n_frames = freqs.shape[0]
     n_sinusoids = freqs.shape[1]
@@ -288,6 +354,8 @@ def main():
     parser.add_argument('--max-sinusoids', type=int, default=2000)
     parser.add_argument('--chunk-frames', type=int, default=1,
                        help='Frames per inference chunk (1=safest, 3=match training, 10=faster but uses more memory)')
+    parser.add_argument('--channel', default=None,
+                       help='HDF5 channel to load (e.g., "c0", "c1"). Default: auto-detect first channel')
     args = parser.parse_args()
 
     # Setup
@@ -323,7 +391,7 @@ def main():
     # Load or extract sinusoids
     if args.h5_file:
         # Load pre-extracted sinusoids from HDF5
-        sinusoids = load_sinusoids_from_h5(args.h5_file, max_sinusoids=args.max_sinusoids)
+        sinusoids = load_sinusoids_from_h5(args.h5_file, max_sinusoids=args.max_sinusoids, channel=args.channel)
         sr = 44100  # Assume 44.1kHz
     else:
         # Extract sinusoids from audio file
