@@ -206,21 +206,71 @@ def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
             first_channel = root_keys[0]
 
             if isinstance(f[first_channel], h5py.Group):
-                # Structure: /c0/freqs, /c0/amps, /c0/phases
+                # Structure: /c0/freqs, /c0/amps, /c0/phases OR sparse format
                 if channel is None:
                     channel = first_channel
                     print(f"Multiple channels found {root_keys}, using '{channel}'")
 
                 group = f[channel]
+                group_keys = list(group.keys())
+
                 if 'freqs' in group:
+                    # Dense format: /c0/freqs, /c0/amps, /c0/phases
                     freqs = np.array(group['freqs'])
                     amps = np.array(group['amps'])
                     phases = np.array(group['phases'])
+
+                elif 'f' in group and 'a' in group and 'p' in group:
+                    # Sparse format: /c0/f (freq), /c0/a (amp), /c0/p (phase)
+                    # with /c0/s (start) and /c0/e (end) or /c0/len for frame boundaries
+                    print(f"Detected sparse HDF5 format with {len(group['f'])} total sinusoids")
+
+                    # Load flat arrays
+                    f_flat = np.array(group['f'])
+                    a_flat = np.array(group['a'])
+                    p_flat = np.array(group['p'])
+
+                    # Determine frame boundaries
+                    if 's' in group and 'e' in group:
+                        starts = np.array(group['s'])
+                        ends = np.array(group['e'])
+                        n_frames = len(starts)
+                    elif 's' in group and 'len' in group:
+                        starts = np.array(group['s'])
+                        lengths = np.array(group['len'])
+                        ends = starts + lengths
+                        n_frames = len(starts)
+                    else:
+                        raise ValueError(f"Cannot determine frame boundaries. Available keys: {group_keys}")
+
+                    print(f"Converting {n_frames} sparse frames to dense format...")
+
+                    # Convert to dense format (n_frames, max_sinusoids, 3)
+                    sinusoids = np.zeros((n_frames, max_sinusoids, 3), dtype=np.float32)
+
+                    for frame_idx in range(n_frames):
+                        start = starts[frame_idx]
+                        end = ends[frame_idx]
+
+                        # Extract sinusoids for this frame
+                        frame_f = f_flat[start:end]
+                        frame_a = a_flat[start:end]
+                        frame_p = p_flat[start:end]
+
+                        # Copy to output (pad or truncate)
+                        n_sines = min(len(frame_f), max_sinusoids)
+                        sinusoids[frame_idx, :n_sines, 0] = frame_f[:n_sines]
+                        sinusoids[frame_idx, :n_sines, 1] = frame_a[:n_sines]
+                        sinusoids[frame_idx, :n_sines, 2] = frame_p[:n_sines]
+
+                    print(f"Converted to dense array: {sinusoids.shape}")
+                    return sinusoids
+
                 else:
                     print(f"\nStructure of /{channel}/:")
                     for key in group.keys():
                         print(f"  {key}: {group[key].shape} {group[key].dtype}")
-                    raise ValueError(f"Channel '{channel}' doesn't contain 'freqs', 'amps', 'phases'")
+                    raise ValueError(f"Channel '{channel}' format not recognized. Expected 'freqs'/'amps'/'phases' or 'f'/'a'/'p'")
 
             elif isinstance(f[first_channel], h5py.Dataset):
                 # Direct arrays: /c0, /c1 where each might be (n_frames, n_sinusoids, 3)
