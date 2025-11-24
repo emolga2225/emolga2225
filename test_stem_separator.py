@@ -406,6 +406,8 @@ def main():
                        help='Frames per inference chunk (1=safest, 3=match training, 10=faster but uses more memory)')
     parser.add_argument('--channel', default=None,
                        help='HDF5 channel to load (e.g., "c0", "c1"). Default: auto-detect first channel')
+    parser.add_argument('--hop-length', type=int, default=512,
+                       help='Hop length for audio reconstruction (default: 512 for STFT, use ~18485 for synchrosqueezed)')
     args = parser.parse_args()
 
     # Setup
@@ -493,7 +495,7 @@ def main():
         stem_sinusoids = predictions[stem_idx]  # (n_frames, max_sines, 3)
 
         # Reconstruct audio
-        stem_audio = sinusoids_to_audio(stem_sinusoids, sr=sr)
+        stem_audio = sinusoids_to_audio(stem_sinusoids, sr=sr, hop_length=args.hop_length)
 
         # Save
         output_file = output_dir / f"{stem_name}.wav"
