@@ -242,51 +242,52 @@ def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
                     amps = np.array(group['amps'])
                     phases = np.array(group['phases'])
 
-                elif 'f' in group and 'a' in group and 'p' in group:
-                    # Sparse format: /c0/f (freq), /c0/a (amp), /c0/p (phase)
-                    # with /c0/s (start) and /c0/e (end) or /c0/len for frame boundaries
+                elif 'f' in group and 'a' in group and 'p' in group and 'i' in group:
+                    # Sparse format: /c0/f (freq), /c0/a (amp), /c0/p (phase), /c0/i (frame indices)
+                    # This is the same format as the preprocessor uses
                     print(f"Detected sparse HDF5 format with {len(group['f'])} total sinusoids")
 
                     # Load flat arrays
-                    f_flat = np.array(group['f'])
-                    a_flat = np.array(group['a'])
-                    p_flat = np.array(group['p'])
+                    track_lens = np.array(group['len'])
+                    frequencies = np.array(group['f'])
+                    amplitudes = np.array(group['a'])
+                    phases = np.array(group['p'])
+                    frame_indices = np.array(group['i'])
 
-                    # Determine frame boundaries
-                    if 's' in group and 'e' in group:
-                        starts = np.array(group['s'])
-                        ends = np.array(group['e'])
-                        n_frames = len(starts)
-                    elif 's' in group and 'len' in group:
-                        starts = np.array(group['s'])
-                        lengths = np.array(group['len'])
-                        ends = starts + lengths
-                        n_frames = len(starts)
-                    else:
-                        raise ValueError(f"Cannot determine frame boundaries. Available keys: {group_keys}")
+                    # Group sinusoids by frame (same logic as preprocessor)
+                    from collections import defaultdict
+                    frame_sinusoids = defaultdict(list)
+
+                    offset = 0
+                    for track_len in track_lens:
+                        track_freqs = frequencies[offset:offset + track_len]
+                        track_amps = amplitudes[offset:offset + track_len]
+                        track_phases = phases[offset:offset + track_len]
+                        track_frames = frame_indices[offset:offset + track_len]
+
+                        # Add all sinusoids from this track to their respective frames
+                        for freq, amp, phase, frame_idx in zip(track_freqs, track_amps, track_phases, track_frames):
+                            frame_sinusoids[int(frame_idx)].append([freq, amp, phase])
+
+                        offset += track_len
+
+                    # Find total number of frames
+                    max_frame_idx = max(frame_sinusoids.keys())
+                    n_frames = max_frame_idx + 1
 
                     print(f"Converting {n_frames} sparse frames to dense format...")
 
                     # Convert to dense format (n_frames, max_sinusoids, 3)
                     sinusoids = np.zeros((n_frames, max_sinusoids, 3), dtype=np.float32)
 
-                    for frame_idx in range(n_frames):
-                        start = starts[frame_idx]
-                        end = ends[frame_idx]
-
-                        # Extract sinusoids for this frame
-                        frame_f = f_flat[start:end]
-                        frame_a = a_flat[start:end]
-                        frame_p = p_flat[start:end]
-
-                        # Copy to output (pad or truncate)
-                        n_sines = min(len(frame_f), max_sinusoids)
-                        sinusoids[frame_idx, :n_sines, 0] = frame_f[:n_sines]
-                        sinusoids[frame_idx, :n_sines, 1] = frame_a[:n_sines]
-                        sinusoids[frame_idx, :n_sines, 2] = frame_p[:n_sines]
+                    for frame_idx, sines in frame_sinusoids.items():
+                        # Sort by frequency for consistency
+                        sines = sorted(sines, key=lambda x: x[0])
+                        n_sines = min(len(sines), max_sinusoids)
+                        sinusoids[frame_idx, :n_sines, :] = sines[:n_sines]
 
                     print(f"Converted to dense array: {sinusoids.shape}")
-                    return sinusoids
+                    return sinusoids, metadata
 
                 else:
                     print(f"\nStructure of /{channel}/:")
@@ -337,7 +338,7 @@ def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
     sinusoids[:, :n_copy, 1] = amps[:, :n_copy]
     sinusoids[:, :n_copy, 2] = phases[:, :n_copy]
 
-    return sinusoids
+    return sinusoids, metadata
 
 
 def extract_sinusoids_simple(audio, sr=44100, n_fft=1024, hop_length=512, max_sinusoids=2000):
@@ -465,8 +466,21 @@ def main():
     # Load or extract sinusoids
     if args.h5_file:
         # Load pre-extracted sinusoids from HDF5
-        sinusoids = load_sinusoids_from_h5(args.h5_file, max_sinusoids=args.max_sinusoids, channel=args.channel)
-        sr = 44100  # Assume 44.1kHz
+        sinusoids, metadata = load_sinusoids_from_h5(args.h5_file, max_sinusoids=args.max_sinusoids, channel=args.channel)
+
+        # Use sample rate from metadata if available
+        sr = metadata.get('sample_rate', 44100)
+        print(f"Using sample rate: {sr} Hz")
+
+        # Auto-detect hop_length from metadata if not specified
+        if args.hop_length == 512 and 'band_sr' in metadata and 'hop_size' in metadata:
+            # Calculate correct hop_length from metadata
+            # hop_at_band_sr * (original_sr / band_sr) = hop_at_original_sr
+            ssq_hop = 16  # Synchrosqueeze hop from extractor
+            band_sr = metadata['band_sr']
+            auto_hop = int((ssq_hop / band_sr) * sr)
+            print(f"Auto-detected hop_length: {auto_hop} (from metadata)")
+            args.hop_length = auto_hop
     else:
         # Extract sinusoids from audio file
         print(f"\nLoading audio: {args.audio_file}")
