@@ -520,6 +520,22 @@ def main():
 
     predictions = predictions[0].numpy()  # (n_stems, n_frames, max_sines, 3)
 
+    # Diagnostic: Check prediction statistics
+    print("\nPrediction statistics:")
+    for stem_idx, stem_name in enumerate(stem_names):
+        stem_preds = predictions[stem_idx]
+        freqs = stem_preds[:, :, 0]
+        amps = stem_preds[:, :, 1]
+        phases = stem_preds[:, :, 2]
+
+        # Count non-zero sinusoids
+        non_zero = (amps > 0.001).sum()
+
+        print(f"  {stem_name}:")
+        print(f"    Freq range: [{freqs.min():.2f}, {freqs.max():.2f}] Hz")
+        print(f"    Amp range: [{amps.min():.6f}, {amps.max():.6f}]")
+        print(f"    Non-zero amps (>0.001): {non_zero}/{amps.size}")
+
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
