@@ -2,7 +2,13 @@
 """
 Test/inference script for the stem separator model.
 
-Usage:
+Usage with HDF5 (synchrosqueezed sinusoids):
+    python test_stem_separator.py \
+        --checkpoint stem_separator_exact_freq_epoch10.pt \
+        --h5-file path/to/song_sinusoids.h5 \
+        --output-dir separated_stems/
+
+Usage with audio file (extracts sinusoids with simple STFT):
     python test_stem_separator.py \
         --checkpoint stem_separator_exact_freq_epoch10.pt \
         --audio-file test.wav \
@@ -15,6 +21,7 @@ import torch.nn.functional as F
 import numpy as np
 import librosa
 import soundfile as sf
+import h5py
 from pathlib import Path
 import argparse
 from tqdm import tqdm
@@ -147,6 +154,54 @@ class TransformerStemSeparator(nn.Module):
         return output
 
 
+def load_sinusoids_from_h5(h5_file, max_sinusoids=2000):
+    """
+    Load synchrosqueezed sinusoids from HDF5 file.
+
+    Expected HDF5 structure:
+        /fullmix/freqs: (n_frames, n_sinusoids) - frequencies in Hz
+        /fullmix/amps: (n_frames, n_sinusoids) - amplitudes
+        /fullmix/phases: (n_frames, n_sinusoids) - phases in radians
+
+    Returns: (n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]
+    """
+    print(f"Loading sinusoids from HDF5: {h5_file}")
+
+    with h5py.File(h5_file, 'r') as f:
+        # Try different possible structures
+        if 'fullmix' in f:
+            # Structure: /fullmix/freqs, /fullmix/amps, /fullmix/phases
+            group = f['fullmix']
+            freqs = np.array(group['freqs'])
+            amps = np.array(group['amps'])
+            phases = np.array(group['phases'])
+        elif 'freqs' in f:
+            # Flat structure: /freqs, /amps, /phases
+            freqs = np.array(f['freqs'])
+            amps = np.array(f['amps'])
+            phases = np.array(f['phases'])
+        else:
+            # List available keys for debugging
+            print(f"Available keys in HDF5: {list(f.keys())}")
+            raise ValueError("Could not find sinusoid data in HDF5. Expected 'fullmix' group or 'freqs' dataset.")
+
+    n_frames = freqs.shape[0]
+    n_sinusoids = freqs.shape[1]
+
+    print(f"Found {n_frames} frames with {n_sinusoids} sinusoids each")
+
+    # Create padded array to match max_sinusoids
+    sinusoids = np.zeros((n_frames, max_sinusoids, 3), dtype=np.float32)
+
+    # Copy data (pad or truncate to max_sinusoids)
+    n_copy = min(n_sinusoids, max_sinusoids)
+    sinusoids[:, :n_copy, 0] = freqs[:, :n_copy]
+    sinusoids[:, :n_copy, 1] = amps[:, :n_copy]
+    sinusoids[:, :n_copy, 2] = phases[:, :n_copy]
+
+    return sinusoids
+
+
 def extract_sinusoids_simple(audio, sr=44100, n_fft=1024, hop_length=512, max_sinusoids=2000):
     """
     Simple sinusoid extraction using STFT peaks.
@@ -223,7 +278,12 @@ def sinusoids_to_audio(sinusoids, sr=44100, hop_length=512):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint (.pt file)')
-    parser.add_argument('--audio-file', required=True, help='Input audio file to separate')
+
+    # Input: either audio file or h5 file
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--audio-file', help='Input audio file (WAV) to separate')
+    input_group.add_argument('--h5-file', help='Input HDF5 file with synchrosqueezed sinusoids')
+
     parser.add_argument('--output-dir', default='separated_stems', help='Output directory for separated stems')
     parser.add_argument('--max-sinusoids', type=int, default=2000)
     args = parser.parse_args()
@@ -258,15 +318,20 @@ def main():
 
     print(f"Loaded model from epoch {checkpoint['epoch']}")
 
-    # Load audio
-    print(f"\nLoading audio: {args.audio_file}")
-    audio, sr = librosa.load(args.audio_file, sr=44100, mono=True)
-    print(f"Audio: {len(audio)/sr:.2f}s @ {sr}Hz")
+    # Load or extract sinusoids
+    if args.h5_file:
+        # Load pre-extracted sinusoids from HDF5
+        sinusoids = load_sinusoids_from_h5(args.h5_file, max_sinusoids=args.max_sinusoids)
+        sr = 44100  # Assume 44.1kHz
+    else:
+        # Extract sinusoids from audio file
+        print(f"\nLoading audio: {args.audio_file}")
+        audio, sr = librosa.load(args.audio_file, sr=44100, mono=True)
+        print(f"Audio: {len(audio)/sr:.2f}s @ {sr}Hz")
 
-    # Extract sinusoids
-    print("\nExtracting sinusoids...")
-    sinusoids = extract_sinusoids_simple(audio, sr=sr, max_sinusoids=args.max_sinusoids)
-    print(f"Extracted {sinusoids.shape[0]} frames")
+        print("\nExtracting sinusoids...")
+        sinusoids = extract_sinusoids_simple(audio, sr=sr, max_sinusoids=args.max_sinusoids)
+        print(f"Extracted {sinusoids.shape[0]} frames")
 
     # Prepare for model
     sinusoids_tensor = torch.from_numpy(sinusoids).unsqueeze(0).to(device)  # (1, n_frames, max_sines, 3)
