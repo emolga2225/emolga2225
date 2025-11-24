@@ -379,7 +379,7 @@ def extract_sinusoids_simple(audio, sr=44100, n_fft=1024, hop_length=512, max_si
     return sinusoids
 
 
-def sinusoids_to_audio(sinusoids, sr=44100, hop_length=512):
+def sinusoids_to_audio(sinusoids, sr=44100, hop_length=512, desc="Reconstructing"):
     """
     Reconstruct audio from sinusoids using overlap-add.
     sinusoids: (n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]
@@ -388,7 +388,7 @@ def sinusoids_to_audio(sinusoids, sr=44100, hop_length=512):
     audio_len = n_frames * hop_length + 1024  # Extra for final frame
     audio = np.zeros(audio_len, dtype=np.float32)
 
-    for frame_idx in range(n_frames):
+    for frame_idx in tqdm(range(n_frames), desc=desc, leave=False):
         t_start = frame_idx * hop_length / sr
         t = np.arange(hop_length) / sr
 
@@ -526,15 +526,17 @@ def main():
 
     # Reconstruct and save each stem
     print("\nReconstructing audio...")
-    for stem_idx, stem_name in enumerate(tqdm(stem_names, desc="Reconstructing stems")):
+    for stem_idx, stem_name in enumerate(stem_names):
+        print(f"  {stem_name}...")
         stem_sinusoids = predictions[stem_idx]  # (n_frames, max_sines, 3)
 
-        # Reconstruct audio
-        stem_audio = sinusoids_to_audio(stem_sinusoids, sr=sr, hop_length=args.hop_length)
+        # Reconstruct audio with progress bar
+        stem_audio = sinusoids_to_audio(stem_sinusoids, sr=sr, hop_length=args.hop_length, desc=f"    {stem_name}")
 
         # Save
         output_file = output_dir / f"{stem_name}.wav"
         sf.write(output_file, stem_audio, sr)
+        print(f"    Saved: {output_file}")
 
     print("\n✨ Done! Separated stems saved to:", output_dir)
     print("\nNOTE: Since the model was trained with NaN loss, the results")
