@@ -48,17 +48,16 @@ class PreprocessedSinusoidDataset(Dataset):
                 frames_by_dir[data_dir] = []
             frames_by_dir[data_dir].append(frame)
 
-        # Create chunks from consecutive frames
+        # Create chunks from consecutive frames with overlap
         for data_dir, dir_frames in frames_by_dir.items():
             # Sort by frame index
             dir_frames.sort(key=lambda x: x['frame_idx'])
 
-            # Create chunks of consecutive frames
-            for i in range(0, len(dir_frames), chunk_frames):
+            # Create overlapping chunks with stride=1 for temporal continuity
+            # This ensures the model learns smooth evolution of freq, amp, and phase
+            for i in range(len(dir_frames) - chunk_frames + 1):
                 chunk_frames_list = dir_frames[i:i + chunk_frames]
-                # Only include complete chunks (drop partial chunks)
-                if len(chunk_frames_list) == chunk_frames:
-                    self.chunks.append(chunk_frames_list)
+                self.chunks.append(chunk_frames_list)
 
         print(f"Loaded preprocessed dataset: {len(self.frames):,} frames")
         print(f"Organized into {len(self.chunks):,} chunks of {chunk_frames} frame(s) each")
