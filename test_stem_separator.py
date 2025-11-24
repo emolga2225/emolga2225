@@ -526,8 +526,7 @@ def main():
 
     # Reconstruct and save each stem
     print("\nReconstructing audio...")
-    for stem_idx, stem_name in enumerate(stem_names):
-        print(f"  {stem_name}...")
+    for stem_idx, stem_name in enumerate(tqdm(stem_names, desc="Reconstructing stems")):
         stem_sinusoids = predictions[stem_idx]  # (n_frames, max_sines, 3)
 
         # Reconstruct audio
@@ -536,7 +535,6 @@ def main():
         # Save
         output_file = output_dir / f"{stem_name}.wav"
         sf.write(output_file, stem_audio, sr)
-        print(f"    Saved: {output_file}")
 
     print("\n✨ Done! Separated stems saved to:", output_dir)
     print("\nNOTE: Since the model was trained with NaN loss, the results")
