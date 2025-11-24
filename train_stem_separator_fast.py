@@ -320,6 +320,8 @@ def main():
                        help='DataLoader workers (can use multiple with preprocessed data)')
     parser.add_argument('--max-grad-norm', type=float, default=1.0,
                        help='Maximum gradient norm for clipping (prevents gradient explosion)')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume training from checkpoint (path to .pt file)')
     args = parser.parse_args()
 
     # Setup
@@ -356,6 +358,16 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        print(f"\nLoading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+        print(f"Resuming from epoch {start_epoch} (loss: {checkpoint['loss']:.6f})")
+
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Data: {len(dataset):,} chunks ({chunk_frames} frame(s) each)")
     print(f"Stems: {dataset.stem_names}")
@@ -382,7 +394,7 @@ def main():
     print(f"  DataLoader workers: {args.num_workers}")
 
     # Training loop
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         loss = train_epoch(
             model, dataloader, optimizer, device,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
