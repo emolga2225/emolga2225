@@ -31,7 +31,7 @@ from tqdm import tqdm
 class TransformerStemSeparator(nn.Module):
     """Same model as in training script - WITH STEM CONDITIONING"""
 
-    def __init__(self, n_stems=5, max_sinusoids=2000, d_model=128, nhead=4,
+    def __init__(self, n_stems=5, max_sinusoids=900, d_model=128, nhead=4,
                  num_layers=4, dim_feedforward=512):
         super().__init__()
         self.n_stems = n_stems
@@ -171,7 +171,7 @@ def explore_h5_structure(f, prefix=''):
     return items
 
 
-def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
+def load_sinusoids_from_h5(h5_file, max_sinusoids=900, channel=None):
     """
     Load synchrosqueezed sinusoids from HDF5 file.
 
@@ -344,7 +344,7 @@ def load_sinusoids_from_h5(h5_file, max_sinusoids=2000, channel=None):
     return sinusoids, metadata
 
 
-def extract_sinusoids_simple(audio, sr=44100, n_fft=1024, hop_length=512, max_sinusoids=2000):
+def extract_sinusoids_simple(audio, sr=44100, n_fft=1024, hop_length=512, max_sinusoids=900):
     """
     Simple sinusoid extraction using STFT peaks.
     Returns: (n_frames, max_sinusoids, 3) where 3 = [freq, amp, phase]

@@ -102,7 +102,7 @@ class TransformerStemSeparator(nn.Module):
     Output: (batch, n_stems, n_frames, max_sinusoids, 3)
     """
 
-    def __init__(self, n_stems=5, max_sinusoids=2000, d_model=128, nhead=4,
+    def __init__(self, n_stems=5, max_sinusoids=900, d_model=128, nhead=4,
                  num_layers=4, dim_feedforward=512):
         super().__init__()
         self.n_stems = n_stems
