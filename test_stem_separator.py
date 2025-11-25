@@ -96,8 +96,22 @@ class TransformerStemSeparator(nn.Module):
         batch_size, n_frames, max_sines, _ = x.shape
         seq_len = n_frames * max_sines
 
+        # NORMALIZE INPUTS to prevent numerical instability
+        # x[..., 0] = frequency (Hz), x[..., 1] = amplitude, x[..., 2] = phase (radians)
+        x_norm = x.clone()
+
+        # Normalize frequency to [0, 1] range (48kHz sample rate, Nyquist = 24kHz)
+        x_norm[..., 0] = x[..., 0] / 24000.0
+
+        # Log-scale amplitude (handles large dynamic range, prevents huge values)
+        # Use log1p to handle zero amplitudes gracefully
+        x_norm[..., 1] = torch.log1p(torch.abs(x[..., 1])) / 10.0  # Scale down by 10
+
+        # Phase already in [-π, π] range - normalize to [-1, 1]
+        x_norm[..., 2] = x[..., 2] / 3.14159265
+
         # Flatten frames into sequence: (batch, n_frames, max_sinusoids, 3) -> (batch, seq_len, 3)
-        x_flat = x.reshape(batch_size, seq_len, 3)
+        x_flat = x_norm.reshape(batch_size, seq_len, 3)
 
         # Embed sinusoids: (batch, seq_len, 3) -> (batch, seq_len, d_model)
         x_embed = self.sinusoid_embed(x_flat)
@@ -145,11 +159,18 @@ class TransformerStemSeparator(nn.Module):
         # Predict sinusoid parameters for all stems at once
         stem_output = self.output_head(encoded)  # (batch, n_stems, n_frames, max_sines, 3)
 
-        # Better amplitude activation: softplus instead of ReLU (no dead gradients)
-        freq = torch.clamp(stem_output[:, :, :, :, 0] * 2205.0, 0, 22050)  # Direct scaling, no ReLU
-        amp = F.softplus(stem_output[:, :, :, :, 1]) * 0.1  # Softplus prevents zeros, scaled down
-        phase = torch.atan2(torch.sin(stem_output[:, :, :, :, 2]),
-                           torch.cos(stem_output[:, :, :, :, 2]))
+        # DENORMALIZE OUTPUTS back to original scale
+        # Model outputs normalized values, convert back to Hz/amplitude/radians
+
+        # Frequency: [0, 1] -> [0, 24000] Hz (48kHz sample rate)
+        freq = torch.sigmoid(stem_output[:, :, :, :, 0]) * 24000.0
+
+        # Amplitude: log-scaled -> linear scale
+        # Model outputs log1p(amp)/10, so reverse: amp = expm1(output * 10)
+        amp = torch.expm1(torch.relu(stem_output[:, :, :, :, 1]) * 10.0)
+
+        # Phase: [-1, 1] -> [-π, π] radians
+        phase = torch.tanh(stem_output[:, :, :, :, 2]) * 3.14159265
 
         # Stack into final output: (batch, n_stems, n_frames, max_sinusoids, 3)
         output = torch.stack([freq, amp, phase], dim=-1)
