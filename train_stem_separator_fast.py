@@ -184,19 +184,26 @@ class TransformerStemSeparator(nn.Module):
 
         # BATCHED STEM CONDITIONING: Process all stems in parallel!
         # Expand input for all stems: (batch, seq_len, d_model) -> (batch, n_stems, seq_len, d_model)
-        x_embed_expanded = x_embed.unsqueeze(1).expand(-1, self.n_stems, -1, -1)
+        # Use repeat() instead of expand() for better numerical stability with mixed precision
+        x_embed_expanded = x_embed.unsqueeze(1).repeat(1, self.n_stems, 1, 1)
 
         # Get all stem embeddings: (n_stems, d_model)
         stem_embeds = self.stem_embeddings.weight  # All stem embeddings at once
 
         # Expand stem embeddings to match input: (n_stems, d_model) -> (batch, n_stems, seq_len, d_model)
-        stem_embeds_expanded = stem_embeds.unsqueeze(0).unsqueeze(2).expand(batch_size, -1, seq_len, -1)
+        # Use repeat() for memory allocation (better with autocast)
+        stem_embeds_expanded = stem_embeds.unsqueeze(0).unsqueeze(2).repeat(batch_size, 1, seq_len, 1)
 
         # Add stem conditioning: (batch, n_stems, seq_len, d_model)
         x_conditioned = x_embed_expanded + stem_embeds_expanded
 
         # Reshape to batch all stems together: (batch, n_stems, seq_len, d_model) -> (batch * n_stems, seq_len, d_model)
         x_conditioned = x_conditioned.reshape(batch_size * self.n_stems, seq_len, self.d_model)
+
+        # Check for NaN after conditioning (debug)
+        if torch.isnan(x_conditioned).any():
+            print(f"NaN in x_conditioned! x_embed range: [{x_embed.min():.4f}, {x_embed.max():.4f}]")
+            print(f"stem_embeds range: [{stem_embeds.min():.4f}, {stem_embeds.max():.4f}]")
 
         # Create padding mask for batched input
         padding_mask = (x_flat[:, :, 0] == 0)  # (batch, seq_len)
