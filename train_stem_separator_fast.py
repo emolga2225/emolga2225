@@ -365,7 +365,7 @@ def main():
         chunk_frames = 1
         print("\nUsing 1 frame per chunk")
     else:
-        chunk_frames = int(args.chunk_duration * 44100 / 512)
+        chunk_frames = int(args.chunk_duration * 48000 / 512)
         print(f"\nUsing {chunk_frames} frames per chunk ({args.chunk_duration}s)")
 
     # Dataset
