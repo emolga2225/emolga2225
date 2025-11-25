@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 # Import the model from training script
 class TransformerStemSeparator(nn.Module):
-    """Same model as in training script"""
+    """Same model as in training script - WITH STEM CONDITIONING"""
 
     def __init__(self, n_stems=5, max_sinusoids=2000, d_model=128, nhead=4,
                  num_layers=4, dim_feedforward=512):
@@ -41,8 +41,17 @@ class TransformerStemSeparator(nn.Module):
         # Embed each sinusoid [freq, amp, phase] -> d_model dimensions
         self.sinusoid_embed = nn.Linear(3, d_model)
 
-        # Positional encoding for sinusoid index
+        # Positional encoding for sinusoid index (which sinusoid in the frame)
         self.sinusoid_pos_embed = nn.Parameter(torch.randn(1, max_sinusoids, d_model))
+
+        # STEM CONDITIONING: Learnable embeddings for each stem type
+        # This tells the model "extract vocals" vs "extract drums" etc.
+        self.stem_embeddings = nn.Embedding(n_stems, d_model)
+
+        # Frame positional embeddings for temporal context (which frame in time)
+        # This is separate from sinusoid position - tells model temporal order
+        self.max_frames = 10  # Support up to 10 frames per chunk
+        self.frame_pos_embed = nn.Parameter(torch.randn(1, self.max_frames, 1, d_model))
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -53,103 +62,88 @@ class TransformerStemSeparator(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Output heads - one per stem
-        self.output_heads = nn.ModuleList([
-            nn.Linear(d_model, 3)  # Predict [freq, amp, phase] for each stem
-            for _ in range(n_stems)
-        ])
+        # Single output head shared across stems (stem conditioning handles differentiation)
+        self.output_head = nn.Linear(d_model, 3)  # Predict [freq, amp, phase]
 
-        # Initialize weights with smaller variance for numerical stability
+        # Initialize weights with better variance
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with small values to prevent early NaN"""
+        """Initialize weights with reasonable values"""
         # Initialize embedding layers
-        nn.init.xavier_uniform_(self.sinusoid_embed.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.sinusoid_embed.weight, gain=0.1)
         nn.init.zeros_(self.sinusoid_embed.bias)
 
-        # Initialize output heads with small weights
-        for head in self.output_heads:
-            nn.init.xavier_uniform_(head.weight, gain=0.01)
-            nn.init.zeros_(head.bias)
+        # Initialize output head
+        nn.init.xavier_uniform_(self.output_head.weight, gain=0.1)
+        nn.init.zeros_(self.output_head.bias)
 
         # Initialize positional embeddings
-        nn.init.normal_(self.sinusoid_pos_embed, mean=0, std=0.01)
+        nn.init.normal_(self.sinusoid_pos_embed, mean=0, std=0.02)
+        nn.init.normal_(self.frame_pos_embed, mean=0, std=0.02)
+
+        # Initialize stem embeddings with larger variance (they're important!)
+        nn.init.normal_(self.stem_embeddings.weight, mean=0, std=0.1)
 
     def forward(self, x):
         """
         x: (batch, n_frames, max_sinusoids, 3)
         returns: (batch, n_stems, n_frames, max_sinusoids, 3)
+
+        NEW: Each stem gets its own conditioned forward pass!
+        The model knows which instrument to extract via stem embeddings.
         """
         batch_size, n_frames, max_sines, _ = x.shape
 
-        if n_frames == 1:
-            # Single frame: process efficiently
-            frame_sines = x[:, 0, :, :]  # (batch, max_sinusoids, 3)
+        # Flatten frames into sequence: (batch, n_frames, max_sinusoids, 3) -> (batch, n_frames * max_sinusoids, 3)
+        x_flat = x.reshape(batch_size, n_frames * max_sines, 3)
 
-            # Embed sinusoids
-            frame_embed = self.sinusoid_embed(frame_sines)
-            frame_embed = frame_embed + self.sinusoid_pos_embed
+        # Embed sinusoids: (batch, seq_len, 3) -> (batch, seq_len, d_model)
+        x_embed = self.sinusoid_embed(x_flat)
 
-            # Padding mask
-            padding_mask = (frame_sines[:, :, 0] == 0)
+        # Add sinusoid positional encoding (which sinusoid within each frame)
+        pos_embed = self.sinusoid_pos_embed.repeat(1, n_frames, 1)
+        x_embed = x_embed + pos_embed
 
-            # Transformer
-            encoded = self.transformer(frame_embed, src_key_padding_mask=padding_mask)
+        # Add frame positional encoding (which frame in time)
+        # Reshape to (batch, n_frames, max_sines, d_model) to add frame positions
+        x_embed_frames = x_embed.reshape(batch_size, n_frames, max_sines, self.d_model)
+        x_embed_frames = x_embed_frames + self.frame_pos_embed[:, :n_frames, :, :]
+        x_embed = x_embed_frames.reshape(batch_size, n_frames * max_sines, self.d_model)
 
-            # Predict for each stem
-            stem_preds = []
-            for stem_idx in range(self.n_stems):
-                stem_output = self.output_heads[stem_idx](encoded)
+        # Create padding mask
+        padding_mask = (x_flat[:, :, 0] == 0)
 
-                # Clamp outputs to prevent extreme values
-                freq = torch.clamp(F.relu(stem_output[:, :, 0]) * 22050 / 100, 0, 22050)
-                amp = torch.clamp(F.relu(stem_output[:, :, 1]), 0, 100)
-                phase = torch.atan2(torch.sin(stem_output[:, :, 2]),
-                                   torch.cos(stem_output[:, :, 2]))
+        # Process each stem separately with stem conditioning
+        stem_preds = []
+        for stem_idx in range(self.n_stems):
+            # Get stem embedding: (d_model,) -> (1, 1, d_model) -> (batch, seq_len, d_model)
+            stem_embed = self.stem_embeddings(torch.tensor([stem_idx], device=x.device))
+            stem_embed = stem_embed.unsqueeze(0).expand(batch_size, n_frames * max_sines, -1)
 
-                stem_prediction = torch.stack([freq, amp, phase], dim=-1)
-                stem_preds.append(stem_prediction)
+            # Add stem conditioning to input
+            x_conditioned = x_embed + stem_embed
 
-            # Stack and add frame dimension
-            output = torch.stack(stem_preds, dim=1).unsqueeze(2)  # (batch, n_stems, 1, max_sines, 3)
+            # Transformer with stem-conditioned input
+            encoded = self.transformer(x_conditioned, src_key_padding_mask=padding_mask)
 
-        else:
-            # Multi-frame: flatten all frames into one sequence for temporal context!
-            x_flat = x.reshape(batch_size, n_frames * max_sines, 3)
-
-            # Embed sinusoids
-            x_embed = self.sinusoid_embed(x_flat)
-
-            # Add positional encodings (tile for each frame)
-            pos_embed = self.sinusoid_pos_embed.repeat(1, n_frames, 1)
-            x_embed = x_embed + pos_embed
-
-            # Create padding mask
-            padding_mask = (x_flat[:, :, 0] == 0)
-
-            # Transformer on full sequence (provides temporal context!)
-            encoded = self.transformer(x_embed, src_key_padding_mask=padding_mask)
-
-            # Reshape back
+            # Reshape back to frames: (batch, n_frames * max_sinusoids, d_model) -> (batch, n_frames, max_sinusoids, d_model)
             encoded = encoded.reshape(batch_size, n_frames, max_sines, self.d_model)
 
-            # Predict for each stem
-            stem_preds = []
-            for stem_idx in range(self.n_stems):
-                stem_output = self.output_heads[stem_idx](encoded)
+            # Predict sinusoid parameters
+            stem_output = self.output_head(encoded)  # (batch, n_frames, max_sines, 3)
 
-                # Clamp outputs to prevent extreme values
-                freq = torch.clamp(F.relu(stem_output[:, :, :, 0]) * 22050 / 100, 0, 22050)
-                amp = torch.clamp(F.relu(stem_output[:, :, :, 1]), 0, 100)
-                phase = torch.atan2(torch.sin(stem_output[:, :, :, 2]),
-                                   torch.cos(stem_output[:, :, :, 2]))
+            # Better amplitude activation: softplus instead of ReLU (no dead gradients)
+            freq = torch.clamp(stem_output[:, :, :, 0] * 2205.0, 0, 22050)  # Direct scaling, no ReLU
+            amp = F.softplus(stem_output[:, :, :, 1]) * 0.1  # Softplus prevents zeros, scaled down
+            phase = torch.atan2(torch.sin(stem_output[:, :, :, 2]),
+                               torch.cos(stem_output[:, :, :, 2]))
 
-                stem_prediction = torch.stack([freq, amp, phase], dim=-1)
-                stem_preds.append(stem_prediction)
+            stem_prediction = torch.stack([freq, amp, phase], dim=-1)
+            stem_preds.append(stem_prediction)
 
-            # Stack stems
-            output = torch.stack(stem_preds, dim=1)
+        # Stack stems: (batch, n_stems, n_frames, max_sinusoids, 3)
+        output = torch.stack(stem_preds, dim=1)
 
         return output
 
