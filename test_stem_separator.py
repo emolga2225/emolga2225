@@ -90,13 +90,14 @@ class TransformerStemSeparator(nn.Module):
         x: (batch, n_frames, max_sinusoids, 3)
         returns: (batch, n_stems, n_frames, max_sinusoids, 3)
 
-        NEW: Each stem gets its own conditioned forward pass!
-        The model knows which instrument to extract via stem embeddings.
+        NEW: Process ALL stems in parallel with batched stem conditioning!
+        Much faster than sequential processing - uses GPU parallelism.
         """
         batch_size, n_frames, max_sines, _ = x.shape
+        seq_len = n_frames * max_sines
 
-        # Flatten frames into sequence: (batch, n_frames, max_sinusoids, 3) -> (batch, n_frames * max_sinusoids, 3)
-        x_flat = x.reshape(batch_size, n_frames * max_sines, 3)
+        # Flatten frames into sequence: (batch, n_frames, max_sinusoids, 3) -> (batch, seq_len, 3)
+        x_flat = x.reshape(batch_size, seq_len, 3)
 
         # Embed sinusoids: (batch, seq_len, 3) -> (batch, seq_len, d_model)
         x_embed = self.sinusoid_embed(x_flat)
@@ -106,44 +107,50 @@ class TransformerStemSeparator(nn.Module):
         x_embed = x_embed + pos_embed
 
         # Add frame positional encoding (which frame in time)
-        # Reshape to (batch, n_frames, max_sines, d_model) to add frame positions
         x_embed_frames = x_embed.reshape(batch_size, n_frames, max_sines, self.d_model)
         x_embed_frames = x_embed_frames + self.frame_pos_embed[:, :n_frames, :, :]
-        x_embed = x_embed_frames.reshape(batch_size, n_frames * max_sines, self.d_model)
+        x_embed = x_embed_frames.reshape(batch_size, seq_len, self.d_model)
 
-        # Create padding mask
-        padding_mask = (x_flat[:, :, 0] == 0)
+        # BATCHED STEM CONDITIONING: Process all stems in parallel!
+        # Expand input for all stems: (batch, seq_len, d_model) -> (batch, n_stems, seq_len, d_model)
+        x_embed_expanded = x_embed.unsqueeze(1).expand(-1, self.n_stems, -1, -1)
 
-        # Process each stem separately with stem conditioning
-        stem_preds = []
-        for stem_idx in range(self.n_stems):
-            # Get stem embedding: (d_model,) -> (1, 1, d_model) -> (batch, seq_len, d_model)
-            stem_embed = self.stem_embeddings(torch.tensor([stem_idx], device=x.device))
-            stem_embed = stem_embed.unsqueeze(0).expand(batch_size, n_frames * max_sines, -1)
+        # Get all stem embeddings: (n_stems, d_model)
+        stem_embeds = self.stem_embeddings.weight  # All stem embeddings at once
 
-            # Add stem conditioning to input
-            x_conditioned = x_embed + stem_embed
+        # Expand stem embeddings to match input: (n_stems, d_model) -> (batch, n_stems, seq_len, d_model)
+        stem_embeds_expanded = stem_embeds.unsqueeze(0).unsqueeze(2).expand(batch_size, -1, seq_len, -1)
 
-            # Transformer with stem-conditioned input
-            encoded = self.transformer(x_conditioned, src_key_padding_mask=padding_mask)
+        # Add stem conditioning: (batch, n_stems, seq_len, d_model)
+        x_conditioned = x_embed_expanded + stem_embeds_expanded
 
-            # Reshape back to frames: (batch, n_frames * max_sinusoids, d_model) -> (batch, n_frames, max_sinusoids, d_model)
-            encoded = encoded.reshape(batch_size, n_frames, max_sines, self.d_model)
+        # Reshape to batch all stems together: (batch, n_stems, seq_len, d_model) -> (batch * n_stems, seq_len, d_model)
+        x_conditioned = x_conditioned.reshape(batch_size * self.n_stems, seq_len, self.d_model)
 
-            # Predict sinusoid parameters
-            stem_output = self.output_head(encoded)  # (batch, n_frames, max_sines, 3)
+        # Create padding mask for batched input
+        padding_mask = (x_flat[:, :, 0] == 0)  # (batch, seq_len)
+        padding_mask_expanded = padding_mask.unsqueeze(1).expand(-1, self.n_stems, -1).reshape(batch_size * self.n_stems, seq_len)
 
-            # Better amplitude activation: softplus instead of ReLU (no dead gradients)
-            freq = torch.clamp(stem_output[:, :, :, 0] * 2205.0, 0, 22050)  # Direct scaling, no ReLU
-            amp = F.softplus(stem_output[:, :, :, 1]) * 0.1  # Softplus prevents zeros, scaled down
-            phase = torch.atan2(torch.sin(stem_output[:, :, :, 2]),
-                               torch.cos(stem_output[:, :, :, 2]))
+        # Single transformer call for ALL stems at once! (batch * n_stems as batch dimension)
+        encoded = self.transformer(x_conditioned, src_key_padding_mask=padding_mask_expanded)
 
-            stem_prediction = torch.stack([freq, amp, phase], dim=-1)
-            stem_preds.append(stem_prediction)
+        # Reshape back: (batch * n_stems, seq_len, d_model) -> (batch, n_stems, seq_len, d_model)
+        encoded = encoded.reshape(batch_size, self.n_stems, seq_len, self.d_model)
 
-        # Stack stems: (batch, n_stems, n_frames, max_sinusoids, 3)
-        output = torch.stack(stem_preds, dim=1)
+        # Reshape to frames: (batch, n_stems, seq_len, d_model) -> (batch, n_stems, n_frames, max_sines, d_model)
+        encoded = encoded.reshape(batch_size, self.n_stems, n_frames, max_sines, self.d_model)
+
+        # Predict sinusoid parameters for all stems at once
+        stem_output = self.output_head(encoded)  # (batch, n_stems, n_frames, max_sines, 3)
+
+        # Better amplitude activation: softplus instead of ReLU (no dead gradients)
+        freq = torch.clamp(stem_output[:, :, :, :, 0] * 2205.0, 0, 22050)  # Direct scaling, no ReLU
+        amp = F.softplus(stem_output[:, :, :, :, 1]) * 0.1  # Softplus prevents zeros, scaled down
+        phase = torch.atan2(torch.sin(stem_output[:, :, :, :, 2]),
+                           torch.cos(stem_output[:, :, :, :, 2]))
+
+        # Stack into final output: (batch, n_stems, n_frames, max_sinusoids, 3)
+        output = torch.stack([freq, amp, phase], dim=-1)
 
         return output
 
