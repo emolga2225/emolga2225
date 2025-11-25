@@ -26,7 +26,7 @@ import json
 class PreprocessedSinusoidDataset(Dataset):
     """Fast dataset that loads preprocessed numpy arrays with multi-frame chunk support"""
 
-    def __init__(self, preprocessed_dir, chunk_frames=1):
+    def __init__(self, preprocessed_dir, chunk_frames=1, subset=None):
         self.preprocessed_dir = Path(preprocessed_dir)
         self.chunk_frames = chunk_frames
 
@@ -61,6 +61,11 @@ class PreprocessedSinusoidDataset(Dataset):
 
         print(f"Loaded preprocessed dataset: {len(self.frames):,} frames")
         print(f"Organized into {len(self.chunks):,} chunks of {chunk_frames} frame(s) each")
+
+        # Apply subset if specified
+        if subset is not None and subset < len(self.chunks):
+            self.chunks = self.chunks[:subset]
+            print(f"Using subset: {len(self.chunks):,} chunks (--subset {subset})")
 
     def __len__(self):
         return len(self.chunks)
@@ -347,6 +352,8 @@ def main():
                        help='Maximum gradient norm for clipping (prevents gradient explosion)')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume training from checkpoint (path to .pt file)')
+    parser.add_argument('--subset', type=int, default=None,
+                       help='Train on subset of N chunks (useful for quick testing)')
     args = parser.parse_args()
 
     # Setup
@@ -362,7 +369,7 @@ def main():
         print(f"\nUsing {chunk_frames} frames per chunk ({args.chunk_duration}s)")
 
     # Dataset
-    dataset = PreprocessedSinusoidDataset(args.preprocessed_dir, chunk_frames=chunk_frames)
+    dataset = PreprocessedSinusoidDataset(args.preprocessed_dir, chunk_frames=chunk_frames, subset=args.subset)
 
     dataloader = DataLoader(
         dataset,
