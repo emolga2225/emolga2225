@@ -150,6 +150,10 @@ class TransformerStemSeparator(nn.Module):
         # Single transformer call for ALL stems at once! (batch * n_stems as batch dimension)
         encoded = self.transformer(x_conditioned, src_key_padding_mask=padding_mask_expanded)
 
+        # Convert nested tensor to dense if needed (handles padding mask optimization)
+        if encoded.is_nested:
+            encoded = encoded.to_padded_tensor(0.0)
+
         # Reshape back: (batch * n_stems, seq_len, d_model) -> (batch, n_stems, seq_len, d_model)
         encoded = encoded.reshape(batch_size, self.n_stems, seq_len, self.d_model)
 
