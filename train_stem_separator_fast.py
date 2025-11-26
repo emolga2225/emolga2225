@@ -248,8 +248,8 @@ class TransformerStemSeparator(nn.Module):
 
         # Amplitude: log-scaled -> linear scale
         # Model outputs log1p(amp)/10, so reverse: amp = expm1(output * 10)
-        # Use softplus instead of relu to handle negative outputs smoothly
-        amp = torch.expm1(F.softplus(stem_output[:, :, :, :, 1]) * 10.0)
+        # ReLU is faster with fp16 and forces model to learn positive outputs
+        amp = torch.expm1(torch.relu(stem_output[:, :, :, :, 1]) * 10.0)
 
         # Phase: [-1, 1] -> [-π, π] radians
         phase = torch.tanh(stem_output[:, :, :, :, 2]) * 3.14159265
