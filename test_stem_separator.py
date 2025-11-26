@@ -562,24 +562,25 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Reconstruct and save each stem
-    print("\nReconstructing audio...")
+    # Save predictions as HDF5 (sparse track format)
+    print("\nConverting to HDF5 track format...")
+    from save_predictions_to_h5 import dense_to_tracks, save_tracks_to_h5
+
     for stem_idx, stem_name in enumerate(stem_names):
-        print(f"  {stem_name}...")
+        print(f"\n{stem_name}:")
         stem_sinusoids = predictions[stem_idx]  # (n_frames, max_sines, 3)
 
-        # Reconstruct audio with progress bar
-        stem_audio = sinusoids_to_audio(stem_sinusoids, sr=sr, hop_length=args.hop_length, desc=f"    {stem_name}")
+        # Convert dense -> tracks
+        tracks = dense_to_tracks(stem_sinusoids, amplitude_threshold=0.001)
+        print(f"  Found {len(tracks)} tracks")
 
-        # Save
-        output_file = output_dir / f"{stem_name}.wav"
-        sf.write(output_file, stem_audio, sr)
-        print(f"    Saved: {output_file}")
+        # Save to HDF5
+        output_file = output_dir / f"{stem_name}_tracks.h5"
+        save_tracks_to_h5(tracks, output_file, sample_rate=sr, fft_size=128, hop_size=128)
 
-    print("\n✨ Done! Separated stems saved to:", output_dir)
-    print("\nNOTE: Since the model was trained with NaN loss, the results")
-    print("      will likely sound terrible or be silent. This is just for fun!")
-    print("      Retrain with proper loss values for real results.")
+    print(f"\n✨ Done! Separated stems saved to: {output_dir}")
+    print("\nTo synthesize audio, use:")
+    print(f"  python synthesize_from_h5.py --input {output_dir}/vocals_tracks.h5 --output vocals.wav")
 
 
 if __name__ == "__main__":
