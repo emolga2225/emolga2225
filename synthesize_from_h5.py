@@ -164,7 +164,7 @@ def main():
     sf.write(output_file, audio, tracks_data['sample_rate'])
 
     duration = len(audio) / tracks_data['sample_rate']
-    print(f"✓ Saved {duration:.2f}s audio ({len(audio):,} samples)")
+    print(f"[OK] Saved {duration:.2f}s audio ({len(audio):,} samples)")
 
 
 if __name__ == "__main__":

@@ -30,12 +30,12 @@ def main():
         h5_file = input_dir / f"{stem_name}_tracks.h5"
 
         if not h5_file.exists():
-            print(f"⚠️  Skipping {stem_name}: {h5_file} not found")
+            print(f"[SKIP] {stem_name}: {h5_file} not found")
             continue
 
         output_file = output_dir / f"{stem_name}.wav"
 
-        print(f"🎵 Synthesizing {stem_name}...")
+        print(f"Synthesizing {stem_name}...")
 
         # Run synthesize_from_h5.py
         cmd = [
@@ -48,12 +48,12 @@ def main():
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            print(f"❌ Error synthesizing {stem_name}:")
+            print(f"[ERROR] synthesizing {stem_name}:")
             print(result.stderr)
         else:
-            print(f"✓ Saved: {output_file}\n")
+            print(f"[OK] Saved: {output_file}\n")
 
-    print(f"\n✨ Done! All stems saved to: {output_dir}")
+    print(f"\n[DONE] All stems saved to: {output_dir}")
 
 
 if __name__ == "__main__":
