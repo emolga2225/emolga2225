@@ -1,0 +1,15 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+h5py>=3.8.0
+tqdm>=4.65.0
+
+# Audio processing
+soundfile>=0.12.0
+
+# NSF/Game music support
+game-music-emu>=0.6.3
+
+# Optional: GPU acceleration for synthesis
+# cupy>=12.0.0  # Uncomment if using --gpu flag
