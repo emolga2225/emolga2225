@@ -45,14 +45,21 @@ pip install scipy>=1.10.0
 pip install h5py>=3.8.0
 pip install tqdm>=4.65.0
 pip install soundfile>=0.12.0
-pip install game-music-emu>=0.6.3
 
 echo.
 echo ============================================================
 echo Setup Complete!
 echo ============================================================
 echo.
-echo You can now prepare NES training data:
+echo IMPORTANT: libgme (for NSF rendering) is NOT a pip package.
+echo You must download libgme.dll separately:
+echo.
+echo   1. Go to: https://github.com/ShiftMediaProject/game-music-emu/releases
+echo   2. Download the latest zip (e.g. libgme_MSVC17_x64.zip)
+echo   3. Extract libgme.dll and place it in this folder:
+echo      %~dp0
+echo.
+echo Once libgme.dll is in place, you can render NSF channels:
 echo   python prepare_nes_training_data.py your_game.nsf --duration 120
 echo.
 pause

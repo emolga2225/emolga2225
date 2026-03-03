@@ -9,7 +9,10 @@ tqdm>=4.65.0
 soundfile>=0.12.0
 
 # NSF/Game music support
-game-music-emu>=0.6.3
+# libgme is NOT a pip package. Download libgme.dll (Windows) or install via:
+#   Linux:  sudo apt install libgme-dev
+#   Mac:    brew install game-music-emu
+#   Windows: https://github.com/ShiftMediaProject/game-music-emu/releases
 
 # Optional: GPU acceleration for synthesis
 # cupy>=12.0.0  # Uncomment if using --gpu flag
